@@ -1,7 +1,6 @@
 """
 main.py — Longbridge Options Radar Scanner
-FastAPI + Longbridge + Telegram Alerts
-زر واحد يمسح 100 سهم ويعرض الفرص
+FastAPI + Longbridge + Telegram Alerts + Monitoring
 """
 import os
 import time
@@ -11,7 +10,7 @@ import traceback
 import requests
 import re
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone, date as date_cls
+from datetime import datetime, timezone, date as date_cls, timedelta
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -46,6 +45,9 @@ _ANALYZE_TTL = 25
 WHALE_MIN_VOLUME = 3000
 WHALE_MIN_OI     = 5000
 
+MONITOR_DAYS = 10   # مدة المراقبة القصوى
+MONITOR_INTERVAL = 60  # كل 60 ثانية
+
 # ============================================================
 # قائمة المسح — 100 سهم
 # ============================================================
@@ -63,10 +65,13 @@ SCAN_SYMBOLS = [
 ]
 
 # ============================================================
-# حالة المسح (in-memory)
+# حالة المسح + المراقبة
 # ============================================================
 _scans: dict[str, dict] = {}
 _SCAN_TTL = 3600
+
+# المراقبة: { symbol: { card, entry, target, stop, direction, expires_at, status, alerts_sent } }
+_monitoring: dict[str, dict] = {}
 
 
 def get_ctx():
@@ -118,6 +123,18 @@ def fetch_candles(symbol, timeframe, count=200):
     return ctx.candlesticks(norm(symbol), p, count,
                             AdjustType.NoAdjust,
                             trade_sessions=TradeSessions.All)
+
+
+def get_current_price(symbol: str) -> float | None:
+    try:
+        ctx = get_ctx()
+        sym = norm(symbol)
+        q = ctx.quote([sym])
+        if q:
+            return float(q[0].last_done)
+    except Exception:
+        pass
+    return None
 
 
 # ============================================================
@@ -425,7 +442,6 @@ def analyze_cached(symbol):
 # منطق المسح
 # ============================================================
 async def run_scan(scan_id: str):
-    """يعمل في الخلفية — يمسح كل الأسهم واحداً واحداً"""
     scan = _scans.get(scan_id)
     if not scan:
         return
@@ -442,15 +458,37 @@ async def run_scan(scan_id: str):
                 continue
 
             data = await asyncio.to_thread(analyze_symbol, sym)
-
             scan["results_map"][sym] = data
 
             card = data.get("card", {})
             color = card.get("color", "gray")
 
-            # ✅ اجمع فقط CALL/PUT المؤكدة
+            # ✅ أضف فقط CALL/PUT المؤكدة
             if color in ("green", "red"):
                 scan["results"].append(data)
+
+                # ✅ أضف إلى المراقبة التلقائية
+                levels = data.get("levels", {})
+                entry = levels.get("entry")
+                target = levels.get("target1")
+                stop = levels.get("stop")
+
+                if entry and target and stop:
+                    _monitoring[sym] = {
+                        "symbol": sym,
+                        "direction": "call" if color == "green" else "put",
+                        "entry": float(entry),
+                        "target": float(target),
+                        "stop": float(stop),
+                        "color": color,
+                        "score": card.get("score", 0),
+                        "created_at": time.time(),
+                        "expires_at": time.time() + MONITOR_DAYS * 86400,
+                        "status": "active",       # active / target_hit / stop_hit / expired
+                        "alerts_sent": set(),
+                        "last_price": float(data.get("price", entry)),
+                    }
+                    print(f"[MONITOR] added {sym} ({color})", flush=True)
 
             scan["completed"] = i + 1
 
@@ -474,6 +512,111 @@ def cleanup_old_scans():
             to_delete.append(sid)
     for sid in to_delete:
         _scans.pop(sid, None)
+
+
+# ============================================================
+# مراقبة البطاقات النشطة
+# ============================================================
+async def monitor_task():
+    """كل 60 ثانية — يفحص كل بطاقة نشطة"""
+    await asyncio.sleep(60)
+
+    while True:
+        try:
+            if not _monitoring:
+                await asyncio.sleep(MONITOR_INTERVAL)
+                continue
+
+            now = time.time()
+
+            for sym in list(_monitoring.keys()):
+                m = _monitoring.get(sym)
+                if not m:
+                    continue
+
+                # ✅ إذا انتهى الأمر — تجاهل
+                if m["status"] != "active":
+                    # إذا انتهت المراقبة > يوم — احذفها تلقائياً
+                    if m["status"] in ("target_hit", "stop_hit", "expired"):
+                        if now - m.get("ended_at", now) > 86400:
+                            _monitoring.pop(sym, None)
+                    continue
+
+                # ✅ انتهت المدة؟
+                if now >= m["expires_at"]:
+                    m["status"] = "expired"
+                    m["ended_at"] = now
+                    await asyncio.to_thread(
+                        send_telegram_alert,
+                        f"⏰ <b>انتهت المدة</b> — {sym}\nمرت {MONITOR_DAYS} أيام بدون هدف أو وقف."
+                    )
+                    continue
+
+                # ✅ اجلب السعر
+                price = await asyncio.to_thread(get_current_price, sym)
+                if price is None:
+                    continue
+
+                m["last_price"] = price
+                direction = m["direction"]
+                target = m["target"]
+                stop = m["stop"]
+
+                # ✅ فحص الهدف
+                if "target" not in m["alerts_sent"]:
+                    if direction == "call" and price >= target:
+                        m["status"] = "target_hit"
+                        m["ended_at"] = now
+                        m["alerts_sent"].add("target")
+                        await asyncio.to_thread(
+                            send_telegram_alert,
+                            f"✅ <b>تحقق الهدف</b> — {sym}\n"
+                            f"السعر: ${price:.2f}\n"
+                            f"الهدف: ${target:.2f}\n"
+                            f"الربح: {((price-target)/target*100):.2f}%"
+                        )
+                        continue
+                    if direction == "put" and price <= target:
+                        m["status"] = "target_hit"
+                        m["ended_at"] = now
+                        m["alerts_sent"].add("target")
+                        await asyncio.to_thread(
+                            send_telegram_alert,
+                            f"✅ <b>تحقق الهدف</b> — {sym}\n"
+                            f"السعر: ${price:.2f}\n"
+                            f"الهدف: ${target:.2f}"
+                        )
+                        continue
+
+                # ✅ فحص الوقف
+                if "stop" not in m["alerts_sent"]:
+                    if direction == "call" and price <= stop:
+                        m["status"] = "stop_hit"
+                        m["ended_at"] = now
+                        m["alerts_sent"].add("stop")
+                        await asyncio.to_thread(
+                            send_telegram_alert,
+                            f"❌ <b>ضرب الوقف</b> — {sym}\n"
+                            f"السعر: ${price:.2f}\n"
+                            f"الوقف: ${stop:.2f}"
+                        )
+                        continue
+                    if direction == "put" and price >= stop:
+                        m["status"] = "stop_hit"
+                        m["ended_at"] = now
+                        m["alerts_sent"].add("stop")
+                        await asyncio.to_thread(
+                            send_telegram_alert,
+                            f"❌ <b>ضرب الوقف</b> — {sym}\n"
+                            f"السعر: ${price:.2f}\n"
+                            f"الوقف: ${stop:.2f}"
+                        )
+                        continue
+
+        except Exception as e:
+            print(f"[MONITOR] error: {e}", flush=True)
+
+        await asyncio.sleep(MONITOR_INTERVAL)
 
 
 # ============================================================
@@ -506,10 +649,12 @@ async def lifespan(app: FastAPI):
                 pass
 
     ka = asyncio.create_task(keepalive())
+    mt = asyncio.create_task(monitor_task())
 
     yield
 
     ka.cancel()
+    mt.cancel()
     global _quote_ctx
     _quote_ctx = None
 
@@ -573,13 +718,24 @@ def scan_status(scan_id: str):
     if not scan:
         return JSONResponse(status_code=404, content={"error": "scan not found"})
 
+    # أضف حالة المراقبة لكل بطاقة
+    results = []
+    for r in scan["results"]:
+        sym = r.get("symbol")
+        m = _monitoring.get(sym, {})
+        r_copy = dict(r)
+        r_copy["monitor_status"] = m.get("status", "none")
+        r_copy["monitor_price"] = m.get("last_price")
+        r_copy["monitor_expires_at"] = m.get("expires_at")
+        results.append(r_copy)
+
     return {
         "scan_id": scan_id,
         "status": scan["status"],
         "total": scan["total"],
         "completed": scan["completed"],
         "found": len(scan["results"]),
-        "results": scan["results"],
+        "results": results,
         "errors_count": len(scan["errors"]),
     }
 
@@ -599,6 +755,58 @@ def scan_latest():
         return JSONResponse(status_code=404, content={"error": "no scans yet"})
     latest_id = max(_scans.keys(), key=lambda k: _scans[k].get("started_at", 0))
     return scan_status(latest_id)
+
+
+# ✅ حالة المراقبة لبطاقة واحدة (للتحديث اللحظي)
+@app.get("/api/monitor/{symbol}")
+def monitor_status(symbol: str):
+    sym = symbol.upper().strip()
+    m = _monitoring.get(sym)
+    if not m:
+        return {"monitored": False}
+    return {
+        "monitored": True,
+        "symbol": sym,
+        "status": m["status"],
+        "entry": m["entry"],
+        "target": m["target"],
+        "stop": m["stop"],
+        "last_price": m.get("last_price"),
+        "expires_at": m["expires_at"],
+        "direction": m["direction"],
+    }
+
+
+# ✅ إيقاف المراقبة (عند حذف البطاقة)
+@app.post("/api/monitor/{symbol}/remove")
+def monitor_remove(symbol: str):
+    sym = symbol.upper().strip()
+    if sym in _monitoring:
+        _monitoring.pop(sym, None)
+        print(f"[MONITOR] removed {sym}", flush=True)
+    return {"ok": True}
+
+
+# ✅ جميع البطاقات المُراقَبة
+@app.get("/api/monitoring")
+def get_monitoring():
+    return {
+        "count": len(_monitoring),
+        "symbols": list(_monitoring.keys()),
+        "details": [
+            {
+                "symbol": s,
+                "status": m["status"],
+                "entry": m["entry"],
+                "target": m["target"],
+                "stop": m["stop"],
+                "last_price": m.get("last_price"),
+                "direction": m["direction"],
+                "score": m["score"],
+            }
+            for s, m in _monitoring.items()
+        ],
+    }
 
 
 @app.get("/api/analyze/{symbol}")
