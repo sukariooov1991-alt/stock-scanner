@@ -1,7 +1,5 @@
 """
 main.py — Longbridge Options Radar Scanner
-FastAPI + Longbridge + Telegram Alerts + Monitoring
-الاستراتيجية: اختراق متسلسل + Retest
 """
 import os
 import time
@@ -42,32 +40,21 @@ _analyze_cache: dict[str, tuple[float, dict]] = {}
 _ANALYZE_TTL = 25
 
 # ✅ فلاتر العقد
-MAX_PREMIUM = 3.0
+MAX_PREMIUM = 2.5
 MAX_SPREAD  = 0.10
 
-# ✅ Cache للشموع
+# ✅ Cache
 _candle_cache: dict[str, tuple[float, list]] = {}
-_CANDLE_TTL = {
-    "15m": 180,
-    "1h":  300,
-    "4h":  900,
-    "1d":  3600,
-    "1w":  3600,
-}
+_CANDLE_TTL = {"15m": 180, "1h": 300, "4h": 900, "1d": 3600, "1w": 3600}
 _CANDLE_CACHE_MAX = 5000
 
 WHALE_MIN_VOLUME = 3000
 WHALE_MIN_OI     = 5000
-
 MONITOR_DAYS = 10
 MONITOR_INTERVAL = 60
 MAX_CONCURRENT = 5
 
-# ============================================================
-# قائمة المسح — 500 سهم (ميجا + لارج كاب)
-# ============================================================
 SCAN_SYMBOLS = [
-    # ═══ ميجا كاب ═══
     "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "NVDA", "META", "BRK-B", "TSLA", "AVGO",
     "WMT", "LLY", "JPM", "V", "UNH", "XOM", "MA", "ORCL", "COST", "HD",
     "PG", "JNJ", "NFLX", "ABBV", "BAC", "CRM", "TMUS", "CVX", "AMD", "KO",
@@ -78,31 +65,23 @@ SCAN_SYMBOLS = [
     "C", "TJX", "MDT", "REGN", "BA", "PLD", "MMC", "CB", "SCHW", "ADP",
     "BSX", "CI", "DE", "ADI", "LMT", "MDLZ", "FI", "BMY", "SO", "CVS",
     "AMAT", "SBUX", "GILD", "PANW", "KLAC", "LRCX", "INTC", "PGR",
-
-    # ═══ تقنية — لارج كاب ═══
     "PLTR", "SHOP", "SNOW", "DDOG", "CRWD", "ZS", "NET", "MDB", "TEAM", "WDAY",
     "ADSK", "CDNS", "SNPS", "ANSS", "FTNT", "OKTA", "DOCU", "TWLO", "HUBS", "ZM",
     "SQ", "PYPL", "COIN", "HOOD", "SOFI", "AFRM", "MRVL", "NXPI", "MCHP", "ON",
     "WDC", "STX", "DELL", "HPQ", "HPE", "NTAP", "SMCI", "ARM", "TER", "ROP",
     "TYL", "PTC", "VRSN", "CTSH", "INFY", "WIT", "EPAM", "GLOB", "FIS", "SSNC",
     "JKHY", "FFIV", "AKAM", "JNPR", "MSI", "APH", "TEL", "GLW", "KEYS",
-
-    # ═══ رعاية صحية ═══
     "HUM", "HCA", "MCK", "ABC", "CAH", "DGX", "LH", "BAX", "BDX", "BIIB",
     "ILMN", "IDXX", "A", "MTD", "WAT", "RMD", "HOLX", "COO", "EW", "DXCM",
     "PODD", "ALGN", "ZBH", "ABMD", "TFX", "STE", "XRAY", "ALC", "CRL", "IQV",
     "PKI", "RVTY", "BIO", "TECH", "QGEN", "MOH", "CNC", "WCG", "ALHC", "OSCR",
     "CLOV", "HIMS", "DOCS", "VEEV", "TDOC", "AMWL", "ONEM", "PHR", "HCTI", "CERT",
     "EVH", "PGNY", "ACCD", "GDRX", "HNGR",
-
-    # ═══ مالية ═══
     "USB", "PNC", "TFC", "MTB", "FITB", "HBAN", "RF", "KEY", "CFG", "STT",
     "BK", "NTRS", "MS", "PRU", "MET", "AFL", "ALL", "TRV", "AIG", "AJG",
     "AON", "MCO", "ICE", "CME", "NDAQ", "CBOE", "MSCI", "MKTX", "TW", "CINF",
     "WRB", "L", "RE", "GL", "CNA", "HIG", "ACGL", "EG", "AIZ", "SYF",
     "DFS", "ALLY", "COF", "BX", "KKR", "APO", "ARES", "OWL", "TPG", "CG",
-
-    # ═══ استهلاكي ═══
     "TGT", "KR", "SYY", "ADM", "GIS", "K", "HSY", "MKC", "CL", "KMB",
     "CHD", "EL", "YUM", "CMG", "DPZ", "WEN", "QSR", "DKNG", "MAR", "HLT",
     "H", "RCL", "CCL", "NCLH", "LUV", "DAL", "AAL", "UAL", "F", "GM",
@@ -111,21 +90,15 @@ SCAN_SYMBOLS = [
     "ULTA", "BBY", "DKS", "ROST", "BURL", "M", "JWN", "KSS", "GPS", "ANF",
     "AEO", "URBN", "PLCE", "BJ", "PSMT", "DLTR", "DG", "FIVE", "OLLI", "BIG",
     "WBA",
-
-    # ═══ صناعة ═══
     "CMI", "PCAR", "MMM", "EMR", "PH", "ROK", "DOV", "IR", "ITW", "CSX",
     "NSC", "UPS", "FDX", "GD", "NOC", "LHX", "HII", "TDG", "HEI", "TXT",
     "AXON", "WM", "RSG", "CWST", "SRCL", "CLH", "ECOL", "USX", "SAIA", "ODFL",
     "XPO", "CHRW", "EXPD", "HUBG", "LSTR", "JBHT", "KNX", "WERN", "SNDR", "ARCB",
     "MRTN", "GWW", "FAST", "POOL", "WSO", "BECN", "BLDR", "UFPI", "BCC", "LPX",
     "MAS", "GEV", "VRT", "GNRC", "PWR", "AME",
-
-    # ═══ طاقة ═══
     "COP", "EOG", "PXD", "DVN", "OXY", "HAL", "SLB", "BKR", "PSX", "VLO",
     "MPC", "KMI", "WMB", "OKE", "ET", "EPD", "PAA", "TRGP", "HES", "MRO",
     "APA", "CTRA", "FANG", "HESM", "DINO", "PBF", "DK", "PARR",
-
-    # ═══ مرافق/اتصالات ═══
     "CMCSA", "CHTR", "WBD", "PARA", "FOXA", "DUK", "D", "AEP", "EXC", "XEL",
     "SRE", "PEG", "ED", "WEC", "ES", "AEE", "DTE", "PPL", "FE", "ETR",
     "CMS", "CNP", "NI", "AES", "NRG", "VST", "CEG", "PSEG", "PNW", "LNT",
@@ -133,10 +106,6 @@ SCAN_SYMBOLS = [
     "ARTNA",
 ]
 
-
-# ============================================================
-# حالة المسح + المراقبة
-# ============================================================
 _scans: dict[str, dict] = {}
 _SCAN_TTL = 3600
 _monitoring: dict[str, dict] = {}
@@ -311,7 +280,7 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
             return f"{prefix}P{str(int(round(sk * 1000))).zfill(8)}.US"
 
         if direction == "bullish":
-            target = price * 1.005
+            target = price * 1.02   # ✅ OTM 2% (أرخص)
             cands = [c for c in chain if _call_of(c) and _strike_of(c) > price]
             if not cands:
                 result["filter_reason"] = "no_call_strike"
@@ -319,7 +288,7 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
             best = min(cands, key=lambda c: abs(_strike_of(c) - target))
             option_symbol = _call_of(best); strike = _strike_of(best); opt_type = "C"
         else:
-            target = price * 0.995
+            target = price * 0.98   # ✅ OTM 2%
             cands = [c for c in chain if _put_of(c) and _strike_of(c) < price]
             if not cands:
                 result["filter_reason"] = "no_put_strike"
@@ -329,7 +298,7 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
 
         result["strike"] = f"{opt_type} {int(strike)}"
 
-        # ✅ فلترة العقد الرئيسي
+        # ✅ فلتر العقد — لا نعود، نكمل
         try:
             oqs = ctx.option_quote([option_symbol])
             if oqs:
@@ -348,22 +317,23 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
 
                 if last is None:
                     result["filter_reason"] = "no_premium"
-                    return result
-                if last > MAX_PREMIUM:
+                    result["filter_pass"] = False
+                elif last > MAX_PREMIUM:
                     result["filter_reason"] = f"premium_too_high ({last})"
-                    return result
-                if spread > MAX_SPREAD:
+                    result["filter_pass"] = False
+                elif spread > MAX_SPREAD:
                     result["filter_reason"] = f"spread_too_wide ({spread:.2f})"
-                    return result
-
-                result["filter_pass"] = True
+                    result["filter_pass"] = False
+                else:
+                    result["filter_pass"] = True
 
                 if hasattr(oq, "delta"):
                     result["delta"] = round(float(oq.delta), 3)
         except Exception as e:
             result["filter_reason"] = f"quote_error: {e}"
-            return result
+            # لا نعود — نكمل
 
+        # ✅ نكمل جلب OI/Volume/Whales دائماً
         all_call_syms, all_put_syms = [], []
         strikes_map = {}
 
@@ -454,57 +424,45 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
 
 
 # ============================================================
-# analyze_symbol — الاستراتيجية الجديدة
+# analyze_symbol
 # ============================================================
 def analyze_symbol(symbol: str) -> dict:
-    # ✅ جلب الشموع لكل الإطارات
     df_weekly = candles_to_df(fetch_candles(symbol, "1w", 150))
     df_daily  = candles_to_df(fetch_candles(symbol, "1d", 400))
     df_4h     = candles_to_df(fetch_candles(symbol, "4h", 200))
     df_1h     = candles_to_df(fetch_candles(symbol, "1h", 200))
     df_15m    = candles_to_df(fetch_candles(symbol, "15m", 200))
 
-    # ✅ السعر الحالي
     q = get_ctx().quote([norm(symbol)])[0]
     price = float(q.last_done)
     prev_close = float(q.prev_close)
 
-    # ✅ تشغيل الاستراتيجية الجديدة
     scan = scan_setup(df_weekly, df_daily, df_4h, df_1h, df_15m)
 
-    # ✅ بناء البطاقة
     card = {
-        "color":   scan["color"],
-        "label":   scan["label"],
-        "status":  scan["status"],
+        "color":     scan["color"],
+        "label":     scan["label"],
+        "status":    scan["status"],
         "direction": scan.get("direction"),
-        "stage":   scan.get("breakout_stage"),
+        "stage":     scan.get("breakout_stage"),
     }
 
     levels = scan.get("levels", {}) or {}
 
-    # ✅ الخيارات فقط عند green/red + فلتر
-    filter_rejected = False
-    filter_reason = ""
+    # ✅ جلب الخيارات (دائماً — حتى لو لا عقد مناسب، لجلب OI/Volume/Whales)
+    direction_opt = "bullish" if scan["color"] == "green" else "bearish"
     if scan["color"] in ("green", "red"):
-        direction_opt = "bullish" if scan["color"] == "green" else "bearish"
         opt = fetch_option_data(symbol, direction_opt, price, "swing")
-        if not opt.get("filter_pass", False):
-            filter_rejected = True
-            filter_reason = opt.get("filter_reason", "unknown")
-            # ⚠️ لا نُلغي البطاقة — نعرضها بدون عقد
     else:
-        opt = _empty_option_result()
+        # للبطاقات الرمادية — نجلب OI/Volume على أي حال
+        opt = fetch_option_data(symbol, "bullish", price, "swing")
 
     levels["strike"]  = opt.get("strike", "—")
     levels["expiry"]  = opt.get("expiry", "—")
     levels["dte"]     = opt.get("dte", "—")
     levels["premium"] = opt.get("premium", "—")
 
-    # ✅ بيانات الدعم والمقاومة
     sr = scan.get("support_resistance", {})
-
-    # ✅ لقطات الفريمات
     timeframes = scan.get("timeframes", [])
 
     supports = []
@@ -536,8 +494,8 @@ def analyze_symbol(symbol: str) -> dict:
         "total_call_vol": opt.get("total_call_vol", 0),
         "total_put_vol":  opt.get("total_put_vol", 0),
         "whales": opt.get("whales", []),
-        "filter_rejected": filter_rejected,
-        "filter_reason": filter_reason,
+        "filter_pass": opt.get("filter_pass", False),
+        "filter_reason": opt.get("filter_reason", ""),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -555,7 +513,7 @@ def analyze_cached(symbol):
 
 
 # ============================================================
-# المسح مع المعالجة المتوازية
+# المسح
 # ============================================================
 async def analyze_one_safe(sym, semaphore):
     async with semaphore:
@@ -635,7 +593,7 @@ def cleanup_old_scans():
 
 
 # ============================================================
-# مراقبة البطاقات
+# المراقبة
 # ============================================================
 async def monitor_task():
     await asyncio.sleep(60)
@@ -718,7 +676,7 @@ async def lifespan(app: FastAPI):
 
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         try:
-            send_telegram_alert("🚀 <b>Longbridge Scanner</b> — النظام يعمل (الاستراتيجية الجديدة)")
+            send_telegram_alert("🚀 <b>Longbridge Scanner</b> — النظام يعمل")
         except Exception: pass
 
     async def keepalive():
