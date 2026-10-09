@@ -1,0 +1,160 @@
+/* ============================================================
+   قسم المسح
+   ============================================================ */
+.scan-section {
+  padding: 20px 14px 14px;
+}
+
+.scan-hero {
+  text-align: center;
+  padding: 24px 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+}
+
+.scan-title {
+  font-size: 24px;
+  font-weight: 800;
+  margin-bottom: 6px;
+  color: var(--text);
+}
+
+.scan-subtitle {
+  font-size: 12.5px;
+  color: var(--text-muted);
+  margin-bottom: 18px;
+  line-height: 1.6;
+}
+
+.scan-subtitle span {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.scan-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 32px;
+  background: linear-gradient(135deg, #2f81f7 0%, #1f6feb 100%);
+  color: #fff;
+  border: none;
+  border-radius: 999px;
+  font-size: 16px;
+  font-weight: 700;
+  cursor: pointer;
+  font-family: inherit;
+  transition: transform 0.15s, box-shadow 0.2s, opacity 0.2s;
+  box-shadow: 0 4px 16px rgba(47,129,247,0.3);
+}
+
+.scan-btn:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 22px rgba(47,129,247,0.4);
+}
+
+.scan-btn:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.scan-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.scan-btn-icon {
+  font-size: 14px;
+}
+
+/* ===== Progress ===== */
+.progress-wrap {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+  direction: rtl;
+}
+
+.progress-info {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  font-weight: 700;
+  font-family: monospace;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+
+.progress-track {
+  width: 100%;
+  height: 10px;
+  background: rgba(255,255,255,0.05);
+  border-radius: 999px;
+  overflow: hidden;
+  margin-bottom: 12px;
+}
+
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #2f81f7, #22c55e);
+  border-radius: 999px;
+  transition: width 0.4s ease-out;
+}
+
+.scan-cancel-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  padding: 6px 16px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.2s, color 0.2s;
+}
+.scan-cancel-btn:hover {
+  background: rgba(239,68,68,0.15);
+  color: var(--red-border);
+  border-color: var(--red-border);
+}
+
+/* ===== الفلاتر ===== */
+.filter-section {
+  padding: 0 14px 14px;
+}
+
+.filter-chips {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+
+.chip {
+  padding: 8px 16px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  font-family: inherit;
+  white-space: nowrap;
+  transition: background 0.2s, color 0.2s, border-color 0.2s;
+}
+
+.chip.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.chip-green.active  { background: var(--green); border-color: var(--green); }
+.chip-red.active    { background: var(--red);   border-color: var(--red); }
+.chip-yellow.active { background: var(--yellow); border-color: var(--yellow); }
+
+.chip-green:not(.active)  { color: var(--green-border);  border-color: rgba(34,197,94,0.3); }
+.chip-red:not(.active)    { color: var(--red-border);    border-color: rgba(239,68,68,0.3); }
+.chip-yellow:not(.active) { color: var(--yellow-border); border-color: rgba(234,179,8,0.3); }
