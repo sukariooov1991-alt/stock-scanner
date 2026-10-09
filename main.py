@@ -1,7 +1,7 @@
 """
 main.py — Longbridge Options Radar Scanner
 FastAPI + Longbridge + Telegram Alerts + Monitoring
-قائمة 500 سهم + فلتر العقد ($3 / $0.10) + معالجة متوازية
+الاستراتيجية: اختراق متسلسل + Retest
 """
 import os
 import time
@@ -23,11 +23,9 @@ from longbridge.openapi import (
 )
 
 from analysis import (
-    ema, rsi, atr, adx, vwap, rvol, macd,
-    swing_highs, swing_lows,
-    trend_status, detect_fvgs, detect_sweep,
-    check_entry_sequence, calculate_score,
-    classify_setup, compute_levels, scan_setup,
+    ema, rsi, atr, adx, vwap,
+    check_breakout, check_retest,
+    scan_setup,
 )
 
 PORT = int(os.environ.get("PORT", 10000))
@@ -49,87 +47,90 @@ MAX_SPREAD  = 0.10
 
 # ✅ Cache للشموع
 _candle_cache: dict[str, tuple[float, list]] = {}
-_CANDLE_TTL = {"1w": 3600, "1d": 3600, "4h": 900, "1h": 300}
-_CANDLE_CACHE_MAX = 4000
+_CANDLE_TTL = {
+    "15m": 180,
+    "1h":  300,
+    "4h":  900,
+    "1d":  3600,
+    "1w":  3600,
+}
+_CANDLE_CACHE_MAX = 5000
 
 WHALE_MIN_VOLUME = 3000
 WHALE_MIN_OI     = 5000
 
 MONITOR_DAYS = 10
 MONITOR_INTERVAL = 60
-
-MAX_CONCURRENT = 5   # المعالجة المتوازية
+MAX_CONCURRENT = 5
 
 # ============================================================
 # قائمة المسح — 500 سهم (ميجا + لارج كاب)
 # ============================================================
 SCAN_SYMBOLS = [
-    # ═══ ميجا كاب (50) ═══
+    # ═══ ميجا كاب ═══
     "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "NVDA", "META", "BRK-B", "TSLA", "AVGO",
     "WMT", "LLY", "JPM", "V", "UNH", "XOM", "MA", "ORCL", "COST", "HD",
     "PG", "JNJ", "NFLX", "ABBV", "BAC", "CRM", "TMUS", "CVX", "AMD", "KO",
     "PEP", "TMO", "LIN", "WFC", "ADBE", "MRK", "DIS", "ACN", "CSCO", "ABT",
     "MCD", "INTU", "VZ", "QCOM", "GE", "TXN", "DHR", "IBM", "CAT", "AXP",
-
-    # ═══ تقنية — لارج كاب (100) ═══
     "AMGN", "NOW", "PM", "NEE", "PFE", "RTX", "SPGI", "UNP", "UBER", "GS",
     "HON", "ISRG", "T", "LOW", "ELV", "SYK", "BKNG", "BLK", "ETN", "VRTX",
     "C", "TJX", "MDT", "REGN", "BA", "PLD", "MMC", "CB", "SCHW", "ADP",
     "BSX", "CI", "DE", "ADI", "LMT", "MDLZ", "FI", "BMY", "SO", "CVS",
-    "AMAT", "SBUX", "GILD", "MU", "PANW", "KLAC", "LRCX", "INTC", "PGR", "ELV",
+    "AMAT", "SBUX", "GILD", "PANW", "KLAC", "LRCX", "INTC", "PGR",
+
+    # ═══ تقنية — لارج كاب ═══
     "PLTR", "SHOP", "SNOW", "DDOG", "CRWD", "ZS", "NET", "MDB", "TEAM", "WDAY",
     "ADSK", "CDNS", "SNPS", "ANSS", "FTNT", "OKTA", "DOCU", "TWLO", "HUBS", "ZM",
     "SQ", "PYPL", "COIN", "HOOD", "SOFI", "AFRM", "MRVL", "NXPI", "MCHP", "ON",
     "WDC", "STX", "DELL", "HPQ", "HPE", "NTAP", "SMCI", "ARM", "TER", "ROP",
-    "TYL", "PTC", "VRSN", "CTSH", "INFY", "WIT", "EPAM", "GLOB", "FIS", "FISV",
-    "SSNC", "JKHY", "FFIV", "AKAM", "JNPR", "MSI", "APH", "TEL", "GLW", "KEYS",
+    "TYL", "PTC", "VRSN", "CTSH", "INFY", "WIT", "EPAM", "GLOB", "FIS", "SSNC",
+    "JKHY", "FFIV", "AKAM", "JNPR", "MSI", "APH", "TEL", "GLW", "KEYS",
 
-    # ═══ رعاية صحية — لارج كاب (60) ═══
+    # ═══ رعاية صحية ═══
     "HUM", "HCA", "MCK", "ABC", "CAH", "DGX", "LH", "BAX", "BDX", "BIIB",
     "ILMN", "IDXX", "A", "MTD", "WAT", "RMD", "HOLX", "COO", "EW", "DXCM",
-    "PODD", "ALGN", "ZBH", "ABMD", "TFX", "COO", "STE", "XRAY", "ALC", "CRL",
-    "IQV", "LH", "MTD", "PKI", "RVTY", "WAT", "BIO", "TECH", "CRL", "QGEN",
-    "MOH", "CNC", "WCG", "ALHC", "OSCR", "CLOV", "HIMS", "DOCS", "VEEV", "TDOC",
-    "AMWL", "ONEM", "PHR", "HCTI", "CERT", "EVH", "PGNY", "ACCD", "GDRX", "HNGR",
+    "PODD", "ALGN", "ZBH", "ABMD", "TFX", "STE", "XRAY", "ALC", "CRL", "IQV",
+    "PKI", "RVTY", "BIO", "TECH", "QGEN", "MOH", "CNC", "WCG", "ALHC", "OSCR",
+    "CLOV", "HIMS", "DOCS", "VEEV", "TDOC", "AMWL", "ONEM", "PHR", "HCTI", "CERT",
+    "EVH", "PGNY", "ACCD", "GDRX", "HNGR",
 
-    # ═══ مالية — لارج كاب (60) ═══
+    # ═══ مالية ═══
     "USB", "PNC", "TFC", "MTB", "FITB", "HBAN", "RF", "KEY", "CFG", "STT",
     "BK", "NTRS", "MS", "PRU", "MET", "AFL", "ALL", "TRV", "AIG", "AJG",
     "AON", "MCO", "ICE", "CME", "NDAQ", "CBOE", "MSCI", "MKTX", "TW", "CINF",
-    "WRB", "L", "RE", "GL", "CNA", "HIG", "AIG", "ACGL", "EG", "AIZ",
-    "SYF", "DFS", "ALLY", "COF", "AXP", "JPM", "BAC", "WFC", "C", "GS",
-    "MS", "BLK", "SCHW", "BX", "KKR", "APO", "ARES", "OWL", "TPG", "CG",
+    "WRB", "L", "RE", "GL", "CNA", "HIG", "ACGL", "EG", "AIZ", "SYF",
+    "DFS", "ALLY", "COF", "BX", "KKR", "APO", "ARES", "OWL", "TPG", "CG",
 
-    # ═══ استهلاكي — لارج كاب (80) ═══
-    "HD", "LOW", "TGT", "KR", "SYY", "ADM", "GIS", "K", "HSY", "MDLZ",
-    "MKC", "CL", "KMB", "CHD", "EL", "PG", "SBUX", "MCD", "YUM", "CMG",
-    "DPZ", "WEN", "QSR", "DKNG", "MAR", "HLT", "H", "RCL", "CCL", "NCLH",
-    "LUV", "DAL", "AAL", "UAL", "F", "GM", "RIVN", "LCID", "NIO", "XPEV",
-    "LI", "TM", "HMC", "STLA", "RACE", "APTV", "BWA", "LEA", "MGA", "ALV",
-    "TSCO", "ORLY", "AZO", "AAP", "GPC", "LKQ", "ULTA", "BBY", "DKS", "ROST",
-    "TJX", "BURL", "M", "JWN", "KSS", "GPS", "ANF", "AEO", "URBN", "PLCE",
-    "COST", "WMT", "BJ", "PSMT", "DLTR", "DG", "FIVE", "OLLI", "BIG", "WBA",
+    # ═══ استهلاكي ═══
+    "TGT", "KR", "SYY", "ADM", "GIS", "K", "HSY", "MKC", "CL", "KMB",
+    "CHD", "EL", "YUM", "CMG", "DPZ", "WEN", "QSR", "DKNG", "MAR", "HLT",
+    "H", "RCL", "CCL", "NCLH", "LUV", "DAL", "AAL", "UAL", "F", "GM",
+    "RIVN", "LCID", "NIO", "XPEV", "LI", "TM", "HMC", "STLA", "RACE", "APTV",
+    "BWA", "LEA", "MGA", "ALV", "TSCO", "ORLY", "AZO", "AAP", "GPC", "LKQ",
+    "ULTA", "BBY", "DKS", "ROST", "BURL", "M", "JWN", "KSS", "GPS", "ANF",
+    "AEO", "URBN", "PLCE", "BJ", "PSMT", "DLTR", "DG", "FIVE", "OLLI", "BIG",
+    "WBA",
 
-    # ═══ صناعة — لارج كاب (70) ═══
-    "CAT", "DE", "CMI", "PCAR", "GE", "MMM", "HON", "EMR", "ETN", "PH",
-    "ROK", "DOV", "IR", "ITW", "CSX", "UNP", "NSC", "UPS", "FDX", "LMT",
-    "RTX", "GD", "NOC", "BA", "LHX", "HII", "TDG", "HEI", "TXT", "AXON",
-    "WM", "RSG", "CWST", "SRCL", "CLH", "ECOL", "USX", "SAIA", "ODFL", "XPO",
-    "CHRW", "EXPD", "HUBG", "LSTR", "JBHT", "KNX", "WERN", "SNDR", "ARCB", "MRTN",
-    "GWW", "FAST", "POOL", "WSO", "BECN", "BLDR", "UFPI", "BCC", "LPX", "MAS",
-    "GEV", "VRT", "GNRC", "PWR", "ETN", "AME", "ROP", "DHR", "ITW", "PH",
+    # ═══ صناعة ═══
+    "CMI", "PCAR", "MMM", "EMR", "PH", "ROK", "DOV", "IR", "ITW", "CSX",
+    "NSC", "UPS", "FDX", "GD", "NOC", "LHX", "HII", "TDG", "HEI", "TXT",
+    "AXON", "WM", "RSG", "CWST", "SRCL", "CLH", "ECOL", "USX", "SAIA", "ODFL",
+    "XPO", "CHRW", "EXPD", "HUBG", "LSTR", "JBHT", "KNX", "WERN", "SNDR", "ARCB",
+    "MRTN", "GWW", "FAST", "POOL", "WSO", "BECN", "BLDR", "UFPI", "BCC", "LPX",
+    "MAS", "GEV", "VRT", "GNRC", "PWR", "AME",
 
-    # ═══ طاقة — لارج كاب (30) ═══
-    "XOM", "CVX", "COP", "EOG", "PXD", "DVN", "OXY", "HAL", "SLB", "BKR",
-    "PSX", "VLO", "MPC", "KMI", "WMB", "OKE", "ET", "EPD", "PAA", "TRGP",
-    "HES", "MRO", "APA", "CTRA", "FANG", "HESM", "DINO", "PBF", "DK", "PARR",
+    # ═══ طاقة ═══
+    "COP", "EOG", "PXD", "DVN", "OXY", "HAL", "SLB", "BKR", "PSX", "VLO",
+    "MPC", "KMI", "WMB", "OKE", "ET", "EPD", "PAA", "TRGP", "HES", "MRO",
+    "APA", "CTRA", "FANG", "HESM", "DINO", "PBF", "DK", "PARR",
 
-    # ═══ مرافق/اتصالات — لارج كاب (50) ═══
-    "T", "VZ", "TMUS", "CMCSA", "CHTR", "DIS", "WBD", "PARA", "NFLX", "FOXA",
-    "NEE", "DUK", "SO", "D", "AEP", "EXC", "XEL", "SRE", "PEG", "ED",
-    "WEC", "ES", "AEE", "DTE", "PPL", "FE", "ETR", "CMS", "CNP", "NI",
-    "AES", "NRG", "VST", "CEG", "PEG", "PSEG", "PNW", "LNT", "EVRG", "OGE",
-    "SRE", "PCG", "EIX", "AWK", "WTRG", "SJW", "CWT", "MSEX", "YORW", "ARTNA",
+    # ═══ مرافق/اتصالات ═══
+    "CMCSA", "CHTR", "WBD", "PARA", "FOXA", "DUK", "D", "AEP", "EXC", "XEL",
+    "SRE", "PEG", "ED", "WEC", "ES", "AEE", "DTE", "PPL", "FE", "ETR",
+    "CMS", "CNP", "NI", "AES", "NRG", "VST", "CEG", "PSEG", "PNW", "LNT",
+    "EVRG", "OGE", "PCG", "EIX", "AWK", "WTRG", "SJW", "CWT", "MSEX", "YORW",
+    "ARTNA",
 ]
 
 
@@ -203,7 +204,7 @@ def fetch_candles(symbol, timeframe, count=200):
                                 trade_sessions=TradeSessions.All)
 
     if len(_candle_cache) > _CANDLE_CACHE_MAX:
-        oldest = sorted(_candle_cache.items(), key=lambda x: x[1][0])[:500]
+        oldest = sorted(_candle_cache.items(), key=lambda x: x[1][0])[:1000]
         for k, _ in oldest:
             _candle_cache.pop(k, None)
 
@@ -345,7 +346,6 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
                 ask = float(getattr(oq, "ask", 0) or 0)
                 spread = (ask - bid) if ask > bid > 0 else 999
 
-                # فحص الفلاتر
                 if last is None:
                     result["filter_reason"] = "no_premium"
                     return result
@@ -454,60 +454,45 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
 
 
 # ============================================================
-# analyze_symbol
+# analyze_symbol — الاستراتيجية الجديدة
 # ============================================================
 def analyze_symbol(symbol: str) -> dict:
+    # ✅ جلب الشموع لكل الإطارات
     df_weekly = candles_to_df(fetch_candles(symbol, "1w", 150))
     df_daily  = candles_to_df(fetch_candles(symbol, "1d", 400))
     df_4h     = candles_to_df(fetch_candles(symbol, "4h", 200))
     df_1h     = candles_to_df(fetch_candles(symbol, "1h", 200))
+    df_15m    = candles_to_df(fetch_candles(symbol, "15m", 200))
 
-    def enrich(df):
-        df["ema20"] = ema(df["close"], 20)
-        df["ema50"] = ema(df["close"], 50)
-        df["rsi"]   = rsi(df["close"], 14)
-        df["atr"]   = atr(df, 14)
-        df["adx"]   = adx(df, 14)
-        df["vwap"]  = vwap(df)
-        return df
-
-    df_weekly = enrich(df_weekly)
-    df_daily  = enrich(df_daily)
-    df_4h     = enrich(df_4h)
-    df_1h     = enrich(df_1h)
-
+    # ✅ السعر الحالي
     q = get_ctx().quote([norm(symbol)])[0]
     price = float(q.last_done)
     prev_close = float(q.prev_close)
 
-    scan = scan_setup(df_weekly, df_daily, df_4h, df_1h)
+    # ✅ تشغيل الاستراتيجية الجديدة
+    scan = scan_setup(df_weekly, df_daily, df_4h, df_1h, df_15m)
 
+    # ✅ بناء البطاقة
     card = {
-        "color":  scan["color"],
-        "label":  scan["label"],
-        "score":  scan["score"],
-        "status": scan["status"],
-        "trend_w":  scan["trend_w"]["status"],
-        "trend_d":  scan["trend_d"]["status"],
-        "trend_4h": scan["trend_4h"]["status"],
-        "rvol":     scan["rvol"],
-        "sweep":    bool(scan.get("sweep")),
-        "fvg":      bool(scan.get("fvg")),
-        "rr":       scan["levels"].get("rr", 0),
+        "color":   scan["color"],
+        "label":   scan["label"],
+        "status":  scan["status"],
+        "direction": scan.get("direction"),
+        "stage":   scan.get("breakout_stage"),
     }
 
-    direction = scan["direction"] or "bullish"
-    levels = scan["levels"]
+    levels = scan.get("levels", {}) or {}
 
-    # ✅ الخيارات فقط عند green/red + فلتر العقد
+    # ✅ الخيارات فقط عند green/red + فلتر
     filter_rejected = False
     filter_reason = ""
     if scan["color"] in ("green", "red"):
-        opt = fetch_option_data(symbol, direction, price, "swing")
+        direction_opt = "bullish" if scan["color"] == "green" else "bearish"
+        opt = fetch_option_data(symbol, direction_opt, price, "swing")
         if not opt.get("filter_pass", False):
             filter_rejected = True
             filter_reason = opt.get("filter_reason", "unknown")
-            opt = _empty_option_result()
+            # ⚠️ لا نُلغي البطاقة — نعرضها بدون عقد
     else:
         opt = _empty_option_result()
 
@@ -516,34 +501,20 @@ def analyze_symbol(symbol: str) -> dict:
     levels["dte"]     = opt.get("dte", "—")
     levels["premium"] = opt.get("premium", "—")
 
-    def tf_snap(df, label, use_ema200=False):
-        ts = trend_status(df, use_ema200=use_ema200)
-        r = df.iloc[-1]
-        return {
-            "label": label,
-            "trend": ts["status"],
-            "ema20": round(float(r["ema20"]), 2),
-            "ema50": round(float(r["ema50"]), 2),
-            "rsi":   round(float(r["rsi"]), 1),
-            "adx":   round(float(r["adx"]), 1),
-            "rvol":  round(rvol(df), 2),
-        }
+    # ✅ بيانات الدعم والمقاومة
+    sr = scan.get("support_resistance", {})
 
-    timeframes = [
-        tf_snap(df_weekly, "1W", use_ema200=False),
-        tf_snap(df_daily,  "1D", use_ema200=True),
-        tf_snap(df_4h,     "4H", use_ema200=False),
-        tf_snap(df_1h,     "1H", use_ema200=False),
-    ]
+    # ✅ لقطات الفريمات
+    timeframes = scan.get("timeframes", [])
 
-    supports = [
-        round(float(df_daily["low"].iloc[-20:].min()), 2),
-        round(float(df_weekly["low"].iloc[-4:].min()), 2),
-    ]
-    resistances = [
-        round(float(df_daily["high"].iloc[-20:].max()), 2),
-        round(float(df_weekly["high"].iloc[-4:].max()), 2),
-    ]
+    supports = []
+    resistances = []
+    if sr.get("weekly"):
+        if sr["weekly"].get("support"): supports.append(sr["weekly"]["support"])
+        if sr["weekly"].get("resistance"): resistances.append(sr["weekly"]["resistance"])
+    if sr.get("daily"):
+        if sr["daily"].get("support"): supports.append(sr["daily"]["support"])
+        if sr["daily"].get("resistance"): resistances.append(sr["daily"]["resistance"])
 
     return {
         "symbol": symbol.upper(),
@@ -554,7 +525,8 @@ def analyze_symbol(symbol: str) -> dict:
         "card": card,
         "levels": levels,
         "timeframes": timeframes,
-        "vwap": round(float(df_1h["vwap"].iloc[-1]), 2),
+        "methods": scan.get("methods", []),
+        "support_resistance": sr,
         "supports": supports,
         "resistances": resistances,
         "call_oi": opt.get("call_oi", []),
@@ -583,7 +555,7 @@ def analyze_cached(symbol):
 
 
 # ============================================================
-# ✅ المسح مع المعالجة المتوازية
+# المسح مع المعالجة المتوازية
 # ============================================================
 async def analyze_one_safe(sym, semaphore):
     async with semaphore:
@@ -602,15 +574,12 @@ async def run_scan(scan_id: str):
     scan["status"] = "running"
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-    # تقسيم القائمة لدفعات من 5
     for i in range(0, len(SCAN_SYMBOLS), MAX_CONCURRENT):
         if scan.get("cancelled"):
             scan["status"] = "cancelled"
             return
 
         batch = SCAN_SYMBOLS[i:i + MAX_CONCURRENT]
-
-        # ✅ معالجة 5 معاً
         results = await asyncio.gather(
             *[analyze_one_safe(sym, semaphore) for sym in batch]
         )
@@ -624,7 +593,7 @@ async def run_scan(scan_id: str):
                 card = data.get("card", {})
                 color = card.get("color", "gray")
 
-                if color in ("green", "red") and not data.get("filter_rejected", False):
+                if color in ("green", "red"):
                     scan["results"].append(data)
 
                     levels = data.get("levels", {})
@@ -640,7 +609,6 @@ async def run_scan(scan_id: str):
                             "target": float(target),
                             "stop": float(stop),
                             "color": color,
-                            "score": card.get("score", 0),
                             "created_at": time.time(),
                             "expires_at": time.time() + MONITOR_DAYS * 86400,
                             "status": "active",
@@ -750,7 +718,7 @@ async def lifespan(app: FastAPI):
 
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         try:
-            send_telegram_alert("🚀 <b>Longbridge Scanner</b> — النظام يعمل (500 سهم)")
+            send_telegram_alert("🚀 <b>Longbridge Scanner</b> — النظام يعمل (الاستراتيجية الجديدة)")
         except Exception: pass
 
     async def keepalive():
@@ -878,10 +846,7 @@ def monitor_remove(symbol: str):
 
 @app.get("/api/monitoring")
 def get_monitoring():
-    return {
-        "count": len(_monitoring),
-        "symbols": list(_monitoring.keys()),
-    }
+    return {"count": len(_monitoring), "symbols": list(_monitoring.keys())}
 
 
 @app.get("/api/cache-stats")
@@ -893,7 +858,6 @@ def cache_stats():
         "symbols_total": len(SCAN_SYMBOLS),
         "max_premium": MAX_PREMIUM,
         "max_spread": MAX_SPREAD,
-        "max_concurrent": MAX_CONCURRENT,
     }
 
 
