@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ماسح الفرص — Longbridge Scanner</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ===== الشريط العلوي ===== -->
+  <header class="topbar">
+    <div class="status market-status" id="marketStatus">
+      <span class="dot"></span>
+      <span class="label">جاري التحميل...</span>
+    </div>
+
+    <div class="status connection-status" id="connectionStatus">
+      <span class="dot"></span>
+      <span class="label">غير متصل</span>
+    </div>
+
+    <button class="theme-btn" id="themeBtn" title="تبديل الخلفية">
+      <span id="themeIcon">🌙</span>
+    </button>
+  </header>
+
+  <!-- ===== قسم المسح ===== -->
+  <section class="scan-section">
+    <div class="scan-hero">
+      <h1 class="scan-title">🔍 ماسح الفرص</h1>
+      <p class="scan-subtitle">
+        مسح تلقائي على <span id="totalSymbols">100</span> سهم — Sweep + FVG + Multi-Timeframe
+      </p>
+
+      <button class="scan-btn" id="scanBtn">
+        <span class="scan-btn-icon">▶</span>
+        <span class="scan-btn-text">ابدأ المسح</span>
+      </button>
+
+      <!-- Progress -->
+      <div class="progress-wrap" id="progressWrap" style="display:none;">
+        <div class="progress-info">
+          <span id="progressText">0 / 100</span>
+          <span id="progressFound">0 فرص</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="progressFill" style="width:0%"></div>
+        </div>
+        <button class="scan-cancel-btn" id="scanCancelBtn">إيقاف</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== فلتر الحالات ===== -->
+  <section class="filter-section" id="filterSection" style="display:none;">
+    <div class="filter-chips">
+      <button class="chip active" data-filter="all">الكل</button>
+      <button class="chip chip-green" data-filter="green">🟢 CALL</button>
+      <button class="chip chip-red" data-filter="red">🔴 PUT</button>
+      <button class="chip chip-yellow" data-filter="yellow">🟡 انتظار</button>
+    </div>
+  </section>
+
+  <!-- ===== منطقة البطاقات ===== -->
+  <main class="cards-area" id="cardsArea"></main>
+
+  <!-- ===== حالة الفراغ ===== -->
+  <div class="empty-state" id="emptyState">
+    <p>اضغط "ابدأ المسح" لفحص السوق</p>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
