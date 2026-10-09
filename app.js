@@ -1,14 +1,16 @@
 /* ============================================================
    app.js — Longbridge Scanner
-   زر مسح واحد + Progress + بطاقات تدريجية
+   زر مسح + مراقبة + شارات الحالة + زر حذف
    ============================================================ */
 const API_BASE = window.location.origin;
 
-let currentScan = null;      // { scan_id, total, status }
-let scanCards = [];          // كل البطاقات
+let currentScan = null;
+let scanCards = [];
 let scanTimer = null;
+let monitorTimers = new Map();   // { symbol: intervalId }
 let activeFilter = "all";
 let lastAlertedState = {};
+let deletedSymbols = new Set();  // لتجنب إعادة الإضافة
 
 const cardsArea = document.getElementById("cardsArea");
 const emptyState = document.getElementById("emptyState");
@@ -87,11 +89,19 @@ function checkSound(symbol, color) {
   lastAlertedState[symbol] = color;
 }
 
-/* ===== ترجمة الاتجاه ===== */
 function trendLabel(t) {
   if (t === "up") return "صاعد ↑";
   if (t === "down") return "هابط ↓";
   return "محايد —";
+}
+
+/* ===== ترجمة حالة المراقبة ===== */
+function monitorStatusLabel(s) {
+  if (s === "target_hit") return { label: "✅ هدف", cls: "ms-target" };
+  if (s === "stop_hit")   return { label: "❌ وقف",  cls: "ms-stop" };
+  if (s === "expired")    return { label: "⏰ منتهي", cls: "ms-expired" };
+  if (s === "active")     return { label: "🟢 مراقبة", cls: "ms-active" };
+  return { label: "", cls: "" };
 }
 
 /* ===== OI Block ===== */
@@ -250,12 +260,18 @@ function buildCard(cardData) {
   const cls = c.color || "gray";
   const price = cardData.price ?? 0;
   const sym = cardData.symbol;
+  const monitorStatus = cardData.monitor_status || "none";
+  const ms = monitorStatusLabel(monitorStatus);
 
   checkSound(sym, cls);
 
   const div = document.createElement("div");
   div.className = "card " + cls;
   div.dataset.symbol = sym;
+
+  const monitorBadge = ms.label
+    ? `<span class="monitor-badge ${ms.cls}">${ms.label}</span>`
+    : "";
 
   const row1 = `<div class="card-row row-1">
     <div class="cell symbol-cell">${sym}</div>
@@ -269,6 +285,13 @@ function buildCard(cardData) {
     </div>
     <div class="cell badge-cell">
       <div class="badge" data-badge>🔥 ${c.label || "—"}</div>
+      ${monitorBadge}
+      <button class="card-trash" data-trash>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="3 6 5 6 21 6"></polyline>
+          <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>
+        </svg>
+      </button>
     </div>
   </div>`;
 
@@ -334,7 +357,7 @@ function buildCard(cardData) {
       <div class="cell"><div class="label">VWAP</div><div class="val">$${cardData.vwap ?? "—"}</div></div>
       <div class="cell"><div class="label">مقاومات</div><div class="val">${(cardData.resistances||[]).join(" / ") || "—"}</div></div>
       <div class="cell"><div class="label">دعوم</div><div class="val">${(cardData.supports||[]).join(" / ") || "—"}</div></div>
-      <div class="cell"><div class="label">السعر</div><div class="val">$${price.toFixed(2)}</div></div>
+      <div class="cell"><div class="label">السعر</div><div class="val" data-btm-price>$${price.toFixed(2)}</div></div>
     </div>
     <div data-summary-wrap>${buildSummaryBar(cardData)}</div>
   </div>`;
@@ -342,11 +365,40 @@ function buildCard(cardData) {
   div.innerHTML = row1 + row2 + row3 + expanded;
   updateAllDynamic(div, sym, cardData);
 
+  // ✅ فتح/إغلاق البطاقة
   div.addEventListener("click", (e) => {
+    if (e.target.closest("[data-trash]")) return;
     div.classList.toggle("open");
   });
 
+  // ✅ حذف البطاقة
+  div.querySelector("[data-trash]").addEventListener("click", async (e) => {
+    e.stopPropagation();
+    await deleteCard(sym);
+  });
+
   return div;
+}
+
+/* ===== حذف البطاقة ===== */
+async function deleteCard(symbol) {
+  // احذف من المصفوفة
+  scanCards = scanCards.filter(c => c.symbol !== symbol);
+  deletedSymbols.add(symbol);
+
+  // أوقف المراقبة
+  try {
+    await fetch(`${API_BASE}/api/monitor/${symbol}/remove`, { method: "POST" });
+  } catch (e) {}
+
+  // أوقف timers الخاصة بالبطاقة
+  if (monitorTimers.has(symbol)) {
+    clearInterval(monitorTimers.get(symbol));
+    monitorTimers.delete(symbol);
+  }
+
+  // أعد الرسم
+  renderCards();
 }
 
 /* ===== عرض البطاقات ===== */
@@ -354,11 +406,11 @@ function renderCards() {
   cardsArea.innerHTML = "";
 
   const filtered = scanCards.filter(c => {
+    if (deletedSymbols.has(c.symbol)) return false;
     if (activeFilter === "all") return true;
     return c.card?.color === activeFilter;
   });
 
-  // ترتيب حسب النقاط
   filtered.sort((a, b) => (b.card?.score ?? 0) - (a.card?.score ?? 0));
 
   filtered.forEach(c => cardsArea.appendChild(buildCard(c)));
@@ -390,6 +442,7 @@ async function startScan() {
   progressWrap.style.display = "block";
   filterSection.style.display = "block";
   scanCards = [];
+  deletedSymbols.clear();
   renderCards();
   progressFill.style.width = "0%";
   progressText.textContent = "0 / 100";
@@ -408,7 +461,6 @@ async function startScan() {
     currentScan = { scan_id: d.scan_id, total: d.total };
     totalSymbols.textContent = d.total;
 
-    // بدء الاستعلام الدوري
     scanTimer = setInterval(pollScanProgress, 2000);
     pollScanProgress();
 
@@ -436,16 +488,13 @@ async function pollScanProgress() {
     progressText.textContent = `${d.completed} / ${d.total}`;
     progressFound.textContent = `${d.found} فرص`;
 
-    // ✅ حدّث البطاقات
     const oldCount = scanCards.length;
     scanCards = d.results || [];
 
-    // أعد الرسم فقط إذا تغيّر عدد البطاقات
     if (scanCards.length !== oldCount) {
       renderCards();
     }
 
-    // إذا انتهى المسح
     if (d.status === "done" || d.status === "cancelled") {
       clearInterval(scanTimer);
       scanTimer = null;
@@ -458,6 +507,9 @@ async function pollScanProgress() {
         emptyState.innerHTML = "<p>لم توجد فرص مطابقة للاستراتيجية</p>";
         emptyState.style.display = "block";
       }
+
+      // ✅ ابدأ المراقبة اللحظية
+      startMonitoring();
     }
   } catch (e) {}
 }
@@ -472,9 +524,90 @@ scanCancelBtn.addEventListener("click", async () => {
   } catch (e) {}
 });
 
+/* ============================================================
+   ✅ المراقبة اللحظية للبطاقات
+   ============================================================ */
+function startMonitoring() {
+  // أوقف أي مراقبة سابقة
+  monitorTimers.forEach(t => clearInterval(t));
+  monitorTimers.clear();
+
+  scanCards.forEach(card => {
+    const sym = card.symbol;
+    fetchMonitorStatus(sym);  // أول استدعاء
+    // كل 30 ثانية
+    const timer = setInterval(() => fetchMonitorStatus(sym), 30000);
+    monitorTimers.set(sym, timer);
+  });
+}
+
+async function fetchMonitorStatus(symbol) {
+  if (deletedSymbols.has(symbol)) return;
+
+  try {
+    // 1) السعر اللحظي
+    const priceRes = await fetch(`${API_BASE}/api/price/${symbol}`);
+    if (priceRes.ok) {
+      const pData = await priceRes.json();
+      if (pData.price) {
+        updateCardPrice(symbol, pData.price);
+      }
+    }
+
+    // 2) حالة المراقبة
+    const mRes = await fetch(`${API_BASE}/api/monitor/${symbol}`);
+    if (mRes.ok) {
+      const m = await mRes.json();
+      if (m.monitored) {
+        updateCardMonitorStatus(symbol, m);
+      }
+    }
+  } catch (e) {}
+}
+
+function updateCardPrice(symbol, price) {
+  const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
+  if (!cardEl) return;
+
+  const priceEl = cardEl.querySelector("[data-price]");
+  if (priceEl) priceEl.textContent = "$" + parseFloat(price).toFixed(2);
+  const btmPrice = cardEl.querySelector("[data-btm-price]");
+  if (btmPrice) btmPrice.textContent = "$" + parseFloat(price).toFixed(2);
+
+  // حدّث في المصفوفة
+  const card = scanCards.find(c => c.symbol === symbol);
+  if (card) card.price = parseFloat(price);
+}
+
+function updateCardMonitorStatus(symbol, m) {
+  const card = scanCards.find(c => c.symbol === symbol);
+  if (card) {
+    card.monitor_status = m.status;
+    card.monitor_price = m.last_price;
+    card.monitor_expires_at = m.expires_at;
+  }
+
+  const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
+  if (!cardEl) return;
+
+  const badgeCell = cardEl.querySelector(".badge-cell");
+  if (!badgeCell) return;
+
+  // احذف الشارة القديمة
+  const old = badgeCell.querySelector(".monitor-badge");
+  if (old) old.remove();
+
+  const ms = monitorStatusLabel(m.status);
+  if (ms.label) {
+    const span = document.createElement("span");
+    span.className = "monitor-badge " + ms.cls;
+    span.textContent = ms.label;
+    badgeCell.insertBefore(span, badgeCell.querySelector("[data-trash]"));
+  }
+}
+
 /* ===== التهيئة ===== */
 (function init() {
-  // جلب عدد الأسهم
   fetch(`${API_BASE}/api/symbols`)
     .then(r => r.json())
     .then(d => { totalSymbols.textContent = d.total; })
