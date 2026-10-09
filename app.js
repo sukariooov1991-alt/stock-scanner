@@ -1,7 +1,9 @@
 /* ============================================================
    app.js — Longbridge Scanner
-   زر مسح + مراقبة + شارات الحالة + زر حذف
-   البطاقات تتراكم — لا تختفي عند مسح جديد
+   الاستراتيجية: اختراق متسلسل + Retest
+   - لا فلاتر (كل البطاقات معاً)
+   - المربعات: دعم/مقاومة/حالة اختراق
+   - بدون شريط الدعوم السفلي
    ============================================================ */
 const API_BASE = window.location.origin;
 
@@ -9,13 +11,10 @@ let currentScan = null;
 let scanCards = [];
 let scanTimer = null;
 let monitorTimers = new Map();
-let activeFilter = "all";
 let lastAlertedState = {};
-
-// ✅ الرموز المحذوفة يدوياً — لا تعود أبداً
 let deletedSymbols = new Set();
 
-// ✅ حفظ المحذوفات في localStorage
+/* ===== Storage ===== */
 function saveDeleted() {
   try {
     localStorage.setItem("scanner_deleted", JSON.stringify([...deletedSymbols]));
@@ -27,8 +26,6 @@ function loadDeleted() {
     if (r) deletedSymbols = new Set(JSON.parse(r));
   } catch (e) {}
 }
-
-// ✅ حفظ البطاقات في localStorage
 function saveCards() {
   try {
     localStorage.setItem("scanner_cards", JSON.stringify(scanCards));
@@ -41,6 +38,7 @@ function loadCards() {
   } catch (e) { return []; }
 }
 
+/* ===== DOM ===== */
 const cardsArea = document.getElementById("cardsArea");
 const emptyState = document.getElementById("emptyState");
 const themeBtn = document.getElementById("themeBtn");
@@ -53,10 +51,9 @@ const progressWrap = document.getElementById("progressWrap");
 const progressFill = document.getElementById("progressFill");
 const progressText = document.getElementById("progressText");
 const progressFound = document.getElementById("progressFound");
-const filterSection = document.getElementById("filterSection");
 const totalSymbols = document.getElementById("totalSymbols");
 
-/* ===== الثيم ===== */
+/* ===== Theme ===== */
 function applyTheme(light) {
   document.body.classList.toggle("light", light);
   themeIcon.textContent = light ? "☀️" : "🌙";
@@ -65,7 +62,7 @@ function applyTheme(light) {
 themeBtn.addEventListener("click", () => applyTheme(!document.body.classList.contains("light")));
 applyTheme(localStorage.getItem("theme") === "light");
 
-/* ===== حالة السوق ===== */
+/* ===== Market Status ===== */
 function updateMarketStatus() {
   const now = new Date();
   const nyH = (now.getUTCHours() - 4 + 24) % 24;
@@ -81,7 +78,7 @@ function updateMarketStatus() {
 updateMarketStatus();
 setInterval(updateMarketStatus, 60000);
 
-/* ===== حالة الاتصال ===== */
+/* ===== Connection ===== */
 function setConnection(online) {
   connectionStatus.className = "status " + (online ? "online" : "offline");
   connectionStatus.querySelector(".label").textContent = online ? "متصل" : "غير متصل";
@@ -94,7 +91,7 @@ async function checkBackendStatus() {
   } catch (e) { setConnection(false); }
 }
 
-/* ===== الصوت ===== */
+/* ===== Sound ===== */
 function playAlertSound(type) {
   try {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -118,12 +115,13 @@ function checkSound(symbol, color) {
   lastAlertedState[symbol] = color;
 }
 
-function trendLabel(t) {
-  if (t === "up") return "صاعد ↑";
-  if (t === "down") return "هابط ↓";
-  return "محايد —";
+/* ===== Labels ===== */
+function stageLabel(stage) {
+  if (stage === "daily_break_weekly") return "اليومي اخترق الأسبوعي";
+  if (stage === "4h_break_daily")     return "4H اخترق اليومي";
+  if (stage === "1h_break_4h")        return "1H اخترق 4H";
+  return "";
 }
-
 function monitorStatusLabel(s) {
   if (s === "target_hit") return { label: "✅ هدف", cls: "ms-target" };
   if (s === "stop_hit")   return { label: "❌ وقف",  cls: "ms-stop" };
@@ -132,7 +130,7 @@ function monitorStatusLabel(s) {
   return { label: "", cls: "" };
 }
 
-/* ===== OI Block ===== */
+/* ===== OI Block (unchanged) ===== */
 function buildOIBlockStatic(title, kind, color) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
@@ -143,7 +141,6 @@ function buildOIBlockStatic(title, kind, color) {
   }
   return `<div class="oi-box"><div class="oi-title">${title}</div><div class="oi-rows">${rows}</div></div>`;
 }
-
 function updateOIBlockData(root, kind, data) {
   if (!root) return;
   data = data || [];
@@ -162,7 +159,7 @@ function updateOIBlockData(root, kind, data) {
   }
 }
 
-/* ===== الحيتان ===== */
+/* ===== Whales (unchanged) ===== */
 function buildWhalesStatic(sym) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
@@ -183,7 +180,6 @@ function buildWhalesStatic(sym) {
     <div class="whales-list">${rows}</div>
   </div>`;
 }
-
 function updateWhalesData(root, sym, whales) {
   if (!root) return;
   const wrap = root.querySelector(`#whales-${sym}`);
@@ -218,7 +214,7 @@ function updateWhalesData(root, sym, whales) {
   }
 }
 
-/* ===== مربعات CALL/PUT ===== */
+/* ===== Put/Call Boxes (unchanged) ===== */
 function updatePutCallBoxes(root, sym, card) {
   const callOI = card.call_oi || [];
   const putOI  = card.put_oi  || [];
@@ -239,47 +235,69 @@ function updatePutCallBoxes(root, sym, card) {
   set("pcbox-put-vol",  putVolTxt);
 }
 
-function updateAllDynamic(root, sym, card) {
-  if (!root || !card) return;
-  const callOI = card.call_oi || [];
-  const putOI  = card.put_oi  || [];
-  updateOIBlockData(root, "put-oi",   putOI);
-  updateOIBlockData(root, "put-liq",  putOI.map(x => ({strike: x.strike, oi: x.volume})));
-  updateOIBlockData(root, "call-oi",  callOI);
-  updateOIBlockData(root, "call-liq", callOI.map(x => ({strike: x.strike, oi: x.volume})));
-  updatePutCallBoxes(root, sym, card);
-  updateWhalesData(root, sym, card.whales || []);
+/* ============================================================
+   ✅ مربع الإطار — دعم / مقاومة / حالة الاختراق
+   ============================================================ */
+function buildTFBox(tf) {
+  const label = tf.label || "—";
+  const support = tf.support;
+  const resistance = tf.resistance;
+  const price = tf.price;
+  const brokeRes = !!tf.broke_resistance;
+  const brokeSup = !!tf.broke_support;
+
+  // تحديد الحالة
+  let statusHtml = "";
+  let boxClass = "tf-cell neutral";
+
+  if (brokeRes) {
+    boxClass = "tf-cell up";
+    statusHtml = `<div class="tf-status tf-broke-up">مخترق ⬆</div>`;
+  } else if (brokeSup) {
+    boxClass = "tf-cell down";
+    statusHtml = `<div class="tf-status tf-broke-down">مكسور ⬇</div>`;
+  } else {
+    statusHtml = `<div class="tf-status tf-no">لم يُخترق</div>`;
+  }
+
+  const supTxt = support != null ? `$${support.toFixed(2)}` : "—";
+  const resTxt = resistance != null ? `$${resistance.toFixed(2)}` : "—";
+  const priceTxt = price != null ? `$${price.toFixed(2)}` : "—";
+
+  return `
+    <div class="${boxClass}">
+      <div class="tf-label"><span>${label}</span></div>
+      <div class="tf-line"><span class="tf-k">مقاومة</span><span class="tf-v">${resTxt}</span></div>
+      <div class="tf-line"><span class="tf-k">دعم</span><span class="tf-v">${supTxt}</span></div>
+      <div class="tf-line tf-price"><span class="tf-k">السعر</span><span class="tf-v">${priceTxt}</span></div>
+      ${statusHtml}
+    </div>
+  `;
 }
 
+/* ============================================================
+   ✅ الشريط السفلي المُبسّط
+   ============================================================ */
 function buildSummaryBar(cardData) {
   const c = cardData.card || {};
   const color = c.color || "gray";
   const label = c.label || "—";
-  const tw = c.trend_w  || "neutral";
-  const td = c.trend_d  || "neutral";
-  const t4 = c.trend_4h || "neutral";
-  const twIcon = tw === "up" ? "🟢" : tw === "down" ? "🔴" : "⚪";
-  const tdIcon = td === "up" ? "🟢" : td === "down" ? "🔴" : "⚪";
-  const t4Icon = t4 === "up" ? "🟢" : t4 === "down" ? "🔴" : "⚪";
-  const rvol = c.rvol ?? "—";
-  const rr   = c.rr ?? "—";
+  const stage = c.stage ? stageLabel(c.stage) : "";
+  const rr = cardData.levels?.rr ?? "—";
   const rrOk = typeof rr === "number" && rr >= 2.0;
+
   return `
     <div class="summary-bar">
       <span class="summary-badge badge-${color}">${label}</span>
-      <span class="summary-item">1W ${twIcon}</span>
-      <span class="summary-sep">·</span>
-      <span class="summary-item">1D ${tdIcon}</span>
-      <span class="summary-sep">·</span>
-      <span class="summary-item">4H ${t4Icon}</span>
-      <span class="summary-sep">·</span>
-      <span class="summary-item">RVOL <b>${rvol}</b></span>
-      <span class="summary-sep">·</span>
+      ${stage ? `<span class="summary-item">${stage}</span><span class="summary-sep">·</span>` : ""}
       <span class="summary-item">R:R <b>${rr}</b> ${rrOk ? "✅" : "⚠️"}</span>
     </div>
   `;
 }
 
+/* ============================================================
+   ✅ بناء البطاقة
+   ============================================================ */
 function buildCard(cardData) {
   const c = cardData.card || {};
   const lv = cardData.levels || {};
@@ -299,6 +317,7 @@ function buildCard(cardData) {
     ? `<span class="monitor-badge ${ms.cls}">${ms.label}</span>`
     : "";
 
+  /* ===== Row 1 ===== */
   const row1 = `<div class="card-row row-1">
     <div class="cell symbol-cell">${sym}</div>
     <div class="cell price-cell">
@@ -306,8 +325,8 @@ function buildCard(cardData) {
       <div class="sub">السعر الحالي</div>
     </div>
     <div class="cell score-cell">
-      <div class="val" data-score>${c.score ?? 0}%</div>
-      <div class="sub">قوة الإشارة</div>
+      <div class="val" data-score>${lv.rr ?? "—"}</div>
+      <div class="sub">R:R</div>
     </div>
     <div class="cell badge-cell">
       <div class="badge" data-badge>🔥 ${c.label || "—"}</div>
@@ -321,6 +340,7 @@ function buildCard(cardData) {
     </div>
   </div>`;
 
+  /* ===== Row 2: العقد ===== */
   const row2 = `<div class="card-row row-2">
     <div class="cell"><div class="label">الأيام</div><div class="val">${lv.dte || "—"}</div></div>
     <div class="cell"><div class="label">سعر العقد</div><div class="val">${lv.premium && lv.premium !== "—" ? "$" + lv.premium : "—"}</div></div>
@@ -328,6 +348,7 @@ function buildCard(cardData) {
     <div class="cell"><div class="label">التنفيذ</div><div class="val">${lv.strike || "—"}</div></div>
   </div>`;
 
+  /* ===== Row 3: المستويات ===== */
   const row3 = `<div class="card-row row-3">
     <div class="cell"><div class="label">الوقف</div><div class="val">${lv.stop ? "$" + lv.stop : "—"}</div></div>
     <div class="cell"><div class="label">R:R</div><div class="val">${lv.rr || "—"}</div></div>
@@ -335,16 +356,11 @@ function buildCard(cardData) {
     <div class="cell"><div class="label">الدخول</div><div class="val">${lv.entry ? "$" + lv.entry : "—"}</div></div>
   </div>`;
 
+  /* ===== المربعات (5 فريمات) ===== */
   const tfs = cardData.timeframes || [];
-  const tfsHtml = tfs.map((t, idx) => `
-    <div class="tf-cell ${t.trend}" data-tf-cell="${idx}">
-      <div class="tf-label"><span>${t.label}</span><span data-tf-trend>${trendLabel(t.trend)}</span></div>
-      <div class="tf-row"><span>EMA</span><span class="v">${t.ema20}/${t.ema50}</span></div>
-      <div class="tf-row"><span>RSI</span><span class="v">${t.rsi}</span></div>
-      <div class="tf-row"><span>ADX</span><span class="v">${t.adx}</span></div>
-      <div class="tf-row"><span>RVOL</span><span class="v">${t.rvol}x</span></div>
-    </div>`).join("");
+  const tfsHtml = tfs.map(t => buildTFBox(t)).join("");
 
+  /* ===== OI + Boxes + Whales ===== */
   const oiHtml = `<div class="oi-grid">
     ${buildOIBlockStatic("مفتوحة - PUT", "put-oi", "#8b5cf6")}
     ${buildOIBlockStatic("سيولة - PUT", "put-liq", "#ef4444")}
@@ -374,17 +390,12 @@ function buildCard(cardData) {
 
   const whalesHtml = buildWhalesStatic(sym);
 
+  /* ===== التوسيع (بدون VWAP/دعوم/مقاومات) ===== */
   const expanded = `<div class="card-expanded">
     <div class="tf-grid">${tfsHtml}</div>
     ${oiHtml}
     ${boxesHtml}
     ${whalesHtml}
-    <div class="bottom-grid">
-      <div class="cell"><div class="label">VWAP</div><div class="val">$${cardData.vwap ?? "—"}</div></div>
-      <div class="cell"><div class="label">مقاومات</div><div class="val">${(cardData.resistances||[]).join(" / ") || "—"}</div></div>
-      <div class="cell"><div class="label">دعوم</div><div class="val">${(cardData.supports||[]).join(" / ") || "—"}</div></div>
-      <div class="cell"><div class="label">السعر</div><div class="val" data-btm-price>$${price.toFixed(2)}</div></div>
-    </div>
     <div data-summary-wrap>${buildSummaryBar(cardData)}</div>
   </div>`;
 
@@ -404,7 +415,24 @@ function buildCard(cardData) {
   return div;
 }
 
-/* ===== حذف البطاقة ===== */
+/* ============================================================
+   تحديث داخلي (بدون إعادة بناء)
+   ============================================================ */
+function updateAllDynamic(root, sym, card) {
+  if (!root || !card) return;
+  const callOI = card.call_oi || [];
+  const putOI  = card.put_oi  || [];
+  updateOIBlockData(root, "put-oi",   putOI);
+  updateOIBlockData(root, "put-liq",  putOI.map(x => ({strike: x.strike, oi: x.volume})));
+  updateOIBlockData(root, "call-oi",  callOI);
+  updateOIBlockData(root, "call-liq", callOI.map(x => ({strike: x.strike, oi: x.volume})));
+  updatePutCallBoxes(root, sym, card);
+  updateWhalesData(root, sym, card.whales || []);
+}
+
+/* ============================================================
+   حذف البطاقة
+   ============================================================ */
 async function deleteCard(symbol) {
   scanCards = scanCards.filter(c => c.symbol !== symbol);
   deletedSymbols.add(symbol);
@@ -423,50 +451,37 @@ async function deleteCard(symbol) {
   renderCards();
 }
 
-/* ===== عرض البطاقات ===== */
+/* ============================================================
+   عرض البطاقات
+   ============================================================ */
 function renderCards() {
   cardsArea.innerHTML = "";
 
-  const filtered = scanCards.filter(c => {
-    if (deletedSymbols.has(c.symbol)) return false;
-    if (activeFilter === "all") return true;
-    return c.card?.color === activeFilter;
+  const filtered = scanCards.filter(c => !deletedSymbols.has(c.symbol));
+  filtered.sort((a, b) => {
+    const sa = a.levels?.rr ?? 0;
+    const sb = b.levels?.rr ?? 0;
+    return sb - sa;
   });
-
-  filtered.sort((a, b) => (b.card?.score ?? 0) - (a.card?.score ?? 0));
 
   filtered.forEach(c => cardsArea.appendChild(buildCard(c)));
 
   emptyState.style.display = filtered.length ? "none" : "block";
-
   if (filtered.length === 0 && scanCards.length > 0) {
-    emptyState.innerHTML = "<p>لا توجد فرص مطابقة للفلتر المحدد</p>";
+    emptyState.innerHTML = "<p>لا توجد فرص حالياً</p>";
   } else if (scanCards.length === 0) {
     emptyState.innerHTML = "<p>اضغط \"ابدأ المسح\" لفحص السوق</p>";
   }
 }
 
-/* ===== الفلاتر ===== */
-document.querySelectorAll(".chip").forEach(chip => {
-  chip.addEventListener("click", () => {
-    document.querySelectorAll(".chip").forEach(c => c.classList.remove("active"));
-    chip.classList.add("active");
-    activeFilter = chip.dataset.filter;
-    renderCards();
-  });
-});
-
-/* ===== زر المسح ===== */
+/* ============================================================
+   زر المسح
+   ============================================================ */
 async function startScan() {
   scanBtn.disabled = true;
   scanBtn.querySelector(".scan-btn-text").textContent = "جاري المسح...";
 
   progressWrap.style.display = "block";
-  filterSection.style.display = "block";
-
-  // ✅ لا نحذف scanCards القديمة
-  // ✅ لا نحذف deletedSymbols
-
   progressFill.style.width = "0%";
   progressText.textContent = "0 / 100";
   progressFound.textContent = "0 فرص";
@@ -498,38 +513,31 @@ function resetScanButton() {
   scanBtn.querySelector(".scan-btn-text").textContent = "ابدأ المسح";
 }
 
-/* ✅ دمج نتائج المسح الجديد مع القديمة */
 function mergeScanResults(newResults) {
-  // خريطة الرموز الحالية
   const existingMap = new Map(scanCards.map(c => [c.symbol, c]));
 
   newResults.forEach(newCard => {
     const sym = newCard.symbol;
-
-    // تجاهل المحذوفات
     if (deletedSymbols.has(sym)) return;
 
     const existing = existingMap.get(sym);
     if (existing) {
-      // ✅ حدّث البطاقة الموجودة (احتفظ بحالة المراقبة)
-      existing.card = newCard.card;
-      existing.levels = newCard.levels;
-      existing.timeframes = newCard.timeframes;
-      existing.price = newCard.price;
-      existing.vwap = newCard.vwap;
-      existing.supports = newCard.supports;
-      existing.resistances = newCard.resistances;
-      existing.call_oi = newCard.call_oi;
-      existing.put_oi = newCard.put_oi;
-      existing.total_call_oi = newCard.total_call_oi;
-      existing.total_put_oi = newCard.total_put_oi;
-      existing.total_call_vol = newCard.total_call_vol;
-      existing.total_put_vol = newCard.total_put_vol;
-      existing.whales = newCard.whales;
-      // monitor_status يبقى كما هو من السيرفر
-      existing.monitor_status = newCard.monitor_status || existing.monitor_status;
+      Object.assign(existing, {
+        card: newCard.card,
+        levels: newCard.levels,
+        timeframes: newCard.timeframes,
+        price: newCard.price,
+        support_resistance: newCard.support_resistance,
+        call_oi: newCard.call_oi,
+        put_oi: newCard.put_oi,
+        total_call_oi: newCard.total_call_oi,
+        total_put_oi: newCard.total_put_oi,
+        total_call_vol: newCard.total_call_vol,
+        total_put_vol: newCard.total_put_vol,
+        whales: newCard.whales,
+        monitor_status: newCard.monitor_status || existing.monitor_status,
+      });
     } else {
-      // ✅ بطاقة جديدة
       scanCards.push(newCard);
     }
   });
@@ -551,7 +559,6 @@ async function pollScanProgress() {
     progressText.textContent = `${d.completed} / ${d.total}`;
     progressFound.textContent = `${d.found} فرص`;
 
-    // ✅ دمج بدل استبدال
     mergeScanResults(d.results || []);
 
     if (d.status === "done" || d.status === "cancelled") {
@@ -560,7 +567,6 @@ async function pollScanProgress() {
       currentScan = null;
       resetScanButton();
       progressWrap.style.display = d.status === "done" ? "none" : "block";
-      filterSection.style.display = "block";
 
       startMonitoring();
     }
@@ -569,7 +575,6 @@ async function pollScanProgress() {
 
 scanBtn.addEventListener("click", startScan);
 
-/* ===== إلغاء المسح ===== */
 scanCancelBtn.addEventListener("click", async () => {
   if (!currentScan) return;
   try {
@@ -577,16 +582,16 @@ scanCancelBtn.addEventListener("click", async () => {
   } catch (e) {}
 });
 
-/* ===== المراقبة اللحظية ===== */
+/* ============================================================
+   المراقبة
+   ============================================================ */
 function startMonitoring() {
-  // أوقف أي مراقبة سابقة
   monitorTimers.forEach(t => clearInterval(t));
   monitorTimers.clear();
 
   scanCards.forEach(card => {
     const sym = card.symbol;
     if (deletedSymbols.has(sym)) return;
-
     fetchMonitorStatus(sym);
     const timer = setInterval(() => fetchMonitorStatus(sym), 30000);
     monitorTimers.set(sym, timer);
@@ -595,7 +600,6 @@ function startMonitoring() {
 
 async function fetchMonitorStatus(symbol) {
   if (deletedSymbols.has(symbol)) return;
-
   try {
     const priceRes = await fetch(`${API_BASE}/api/price/${symbol}`);
     if (priceRes.ok) {
@@ -616,8 +620,6 @@ function updateCardPrice(symbol, price) {
   if (!cardEl) return;
   const priceEl = cardEl.querySelector("[data-price]");
   if (priceEl) priceEl.textContent = "$" + parseFloat(price).toFixed(2);
-  const btmPrice = cardEl.querySelector("[data-btm-price]");
-  if (btmPrice) btmPrice.textContent = "$" + parseFloat(price).toFixed(2);
 
   const card = scanCards.find(c => c.symbol === symbol);
   if (card) card.price = parseFloat(price);
@@ -627,10 +629,7 @@ function updateCardMonitorStatus(symbol, m) {
   const card = scanCards.find(c => c.symbol === symbol);
   if (card) {
     card.monitor_status = m.status;
-    card.monitor_price = m.last_price;
-    card.monitor_expires_at = m.expires_at;
   }
-
   const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
   if (!cardEl) return;
   const badgeCell = cardEl.querySelector(".badge-cell");
@@ -648,21 +647,17 @@ function updateCardMonitorStatus(symbol, m) {
   }
 }
 
-/* ===== التهيئة ===== */
+/* ============================================================
+   التهيئة
+   ============================================================ */
 (function init() {
-  // استرجاع البطاقات المحفوظة
   scanCards = loadCards();
   loadDeleted();
-
-  // استبعد المحذوفات
   scanCards = scanCards.filter(c => !deletedSymbols.has(c.symbol));
-
   renderCards();
 
-  // شغّل المراقبة للبطاقات الموجودة
   if (scanCards.length > 0) {
     startMonitoring();
-    filterSection.style.display = "block";
   }
 
   fetch(`${API_BASE}/api/symbols`)
