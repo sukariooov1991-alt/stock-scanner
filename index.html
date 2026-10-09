@@ -8,29 +8,25 @@
 </head>
 <body>
 
-  <!-- ===== الشريط العلوي ===== -->
   <header class="topbar">
     <div class="status market-status" id="marketStatus">
       <span class="dot"></span>
       <span class="label">جاري التحميل...</span>
     </div>
-
     <div class="status connection-status" id="connectionStatus">
       <span class="dot"></span>
       <span class="label">غير متصل</span>
     </div>
-
     <button class="theme-btn" id="themeBtn" title="تبديل الخلفية">
       <span id="themeIcon">🌙</span>
     </button>
   </header>
 
-  <!-- ===== قسم المسح ===== -->
   <section class="scan-section">
     <div class="scan-hero">
       <h1 class="scan-title">🔍 ماسح الفرص</h1>
       <p class="scan-subtitle">
-        مسح تلقائي على <span id="totalSymbols">100</span> سهم — Sweep + FVG + Multi-Timeframe
+        مسح تلقائي على <span id="totalSymbols">500</span> سهم — اختراق متسلسل + Retest
       </p>
 
       <button class="scan-btn" id="scanBtn">
@@ -40,7 +36,7 @@
 
       <div class="progress-wrap" id="progressWrap" style="display:none;">
         <div class="progress-info">
-          <span id="progressText">0 / 100</span>
+          <span id="progressText">0 / 500</span>
           <span id="progressFound">0 فرص</span>
         </div>
         <div class="progress-track">
@@ -51,19 +47,8 @@
     </div>
   </section>
 
-  <!-- ===== فلتر الحالات ===== -->
-  <section class="filter-section" id="filterSection" style="display:none;">
-    <div class="filter-chips">
-      <button class="chip active" data-filter="all">الكل</button>
-      <button class="chip chip-green" data-filter="green">🟢 CALL</button>
-      <button class="chip chip-red" data-filter="red">🔴 PUT</button>
-    </div>
-  </section>
-
-  <!-- ===== منطقة البطاقات ===== -->
   <main class="cards-area" id="cardsArea"></main>
 
-  <!-- ===== حالة الفراغ ===== -->
   <div class="empty-state" id="emptyState">
     <p>اضغط "ابدأ المسح" لفحص السوق</p>
   </div>
