@@ -1,17 +1,6 @@
 """
 analysis.py — Longbridge Options Radar
 استراتيجية: اختراق متسلسل + Retest (Cascade Break & Retest)
-
-التسلسل:
-  1W: قمة/قاع الأسبوع الماضي (المستويات الرئيسية)
-  1D: هل اخترق مستوى الأسبوع بحجم؟ → 4H retest
-  4H: هل اخترق مستوى اليوم بحجم؟ → 1H retest
-  1H: هل اخترق مستوى 4H بحجم؟ → 15m retest
-  
-الدخول: عند Retest (3 طرق)
-الهدف: أعلى قمة بعد الاختراق
-الوقف: تحت المستوى المكسور + 0.5×ATR
-المهل: 5 شموع كحد أقصى للـ Retest
 """
 import numpy as np
 import pandas as pd
@@ -64,14 +53,13 @@ def rvol_series(df, n=20):
 # ============================================================
 # أدوات
 # ============================================================
-MIN_RVOL = 1.5              # الحجم الأدنى للاختراق
-MAX_RETEST_CANDLES = 5      # مهلة Retest
-RETEST_TOLERANCE_PCT = 0.3  # تسامح اللمس
-BREAKOUT_LOOKBACK = 10      # نافذة البحث عن الاختراق
+MIN_RVOL = 1.5
+MAX_RETEST_CANDLES = 5
+RETEST_TOLERANCE_PCT = 0.3
+BREAKOUT_LOOKBACK = 10
 
 
 def prev_candle_hl(df, idx=-2):
-    """أعلى/أدنى شمعة مكتملة سابقة"""
     if df is None or len(df) < abs(idx):
         return None, None
     row = df.iloc[idx]
@@ -88,11 +76,6 @@ def last_price(df):
 # 1. فحص الاختراق (بحجم)
 # ============================================================
 def check_breakout(df, level, direction, lookback=BREAKOUT_LOOKBACK, min_rvol=MIN_RVOL):
-    """
-    يفحص هل اخترق السعر المستوى خلال آخر lookback شمعة.
-    direction = "up"  → إغلاق شمعة فوق المستوى بحجم
-    direction = "down" → إغلاق شمعة تحت المستوى بحجم
-    """
     if df is None or len(df) < 25 or level is None:
         return {"broken": False}
 
@@ -100,7 +83,6 @@ def check_breakout(df, level, direction, lookback=BREAKOUT_LOOKBACK, min_rvol=MI
     n = len(df)
     start = max(0, n - lookback)
 
-    # نبحث من الأحدث للأقدم
     for i in range(n - 1, start - 1, -1):
         rv = rvol.iloc[i]
         if pd.isna(rv):
@@ -110,7 +92,6 @@ def check_breakout(df, level, direction, lookback=BREAKOUT_LOOKBACK, min_rvol=MI
 
         if direction == "up":
             if float(row["close"]) > level and rv >= min_rvol:
-                # أعلى قمة بعد الاختراق
                 peak = float(df["high"].iloc[i:].max())
                 return {
                     "broken": True,
@@ -144,11 +125,6 @@ def check_breakout(df, level, direction, lookback=BREAKOUT_LOOKBACK, min_rvol=MI
 # ============================================================
 def check_retest(df, level, direction, max_candles=MAX_RETEST_CANDLES,
                  tolerance_pct=RETEST_TOLERANCE_PCT):
-    """
-    يفحص آخر شمعة: هل هي شمعة Retest صالحة؟
-    direction = "up"   → Level أصبح دعماً، ننتظر ارتداد صاعد
-    direction = "down" → Level أصبح مقاومة، ننتظر ارتداد هابط
-    """
     if df is None or len(df) < 3 or level is None:
         return {"retested": False, "status": "no_data"}
 
@@ -165,7 +141,6 @@ def check_retest(df, level, direction, max_candles=MAX_RETEST_CANDLES,
         closed_above = last_close > level
         bullish = last_close > last_open
         if touched and closed_above and bullish:
-            # قوة الشمعة (لطريقة الدخول 2)
             body = last_close - last_open
             full_range = max(last_high - last_low, 0.0001)
             body_ratio = body / full_range
@@ -180,10 +155,8 @@ def check_retest(df, level, direction, max_candles=MAX_RETEST_CANDLES,
                 "body_ratio": round(body_ratio, 2),
                 "strong": body_ratio >= 0.6,
             }
-        # لم يلمس
         return {"retested": False, "status": "waiting"}
-
-    else:  # down
+    else:
         touched = last_high >= (level - tol)
         closed_below = last_close < level
         bearish = last_close < last_open
@@ -209,12 +182,6 @@ def check_retest(df, level, direction, max_candles=MAX_RETEST_CANDLES,
 # 3. طرق الدخول الثلاث
 # ============================================================
 def detect_entry_methods(df, level, direction):
-    """
-    يكشف طرق الدخول المتاحة على آخر شمعة:
-      1. إغلاق شمعة Retest
-      2. نمط تأكيدي (جسم قوي)
-      3. اختراق قمة/قاع شمعة Retest
-    """
     methods = []
     if df is None or len(df) < 3 or level is None:
         return methods
@@ -226,14 +193,12 @@ def detect_entry_methods(df, level, direction):
     last = df.iloc[-1]
     close = float(last["close"])
 
-    # ✅ الطريقة 1: إغلاق شمعة Retest
     methods.append({
         "name": "retest_close",
         "label": "إغلاق Retest",
         "entry": round(close, 2),
     })
 
-    # ✅ الطريقة 2: نمط تأكيدي (جسم قوي)
     if retest.get("strong"):
         methods.append({
             "name": "pattern",
@@ -241,8 +206,6 @@ def detect_entry_methods(df, level, direction):
             "entry": round(close, 2),
         })
 
-    # ✅ الطريقة 3: اختراق قمة/قاع شمعة Retest (يحتاج شمعة تالية)
-    # نفحص آخر شمعتين
     if len(df) >= 2:
         retest_candle = df.iloc[-2]
         current = df.iloc[-1]
@@ -265,8 +228,34 @@ def detect_entry_methods(df, level, direction):
 
 
 # ============================================================
-# 4. بناء نتيجة البطاقة
+# 4. لقطة الإطار (✅ محدّثة)
 # ============================================================
+def _tf_snapshot(df, label):
+    """لقطة إطار: دعم/مقاومة خاصّة به + حالة الاختراق"""
+    if df is None or len(df) < 5:
+        return {
+            "label": label,
+            "support": None,
+            "resistance": None,
+            "broke_resistance": False,
+            "broke_support": False,
+        }
+
+    sup, res = prev_candle_hl(df, -2)
+    price = float(df.iloc[-1]["close"])
+
+    broke_res = (res is not None) and (price > res)
+    broke_sup = (sup is not None) and (price < sup)
+
+    return {
+        "label": label,
+        "support": round(sup, 2) if sup else None,
+        "resistance": round(res, 2) if res else None,
+        "broke_resistance": broke_res,
+        "broke_support": broke_sup,
+    }
+
+
 def _empty_result():
     return {
         "color": "gray",
@@ -280,89 +269,34 @@ def _empty_result():
     }
 
 
-def _tf_snapshot(df, label, level_h=None, level_l=None):
-    """لقطة إطار: دعم/مقاومة/سعر/حالة الاختراق"""
-    if df is None or len(df) < 5:
-        return {
-            "label": label,
-            "support": None,
-            "resistance": None,
-            "price": None,
-            "broke_resistance": False,
-            "broke_support": False,
-        }
-
-    price = float(df.iloc[-1]["close"])
-    sup = level_l
-    res = level_h
-
-    broke_res = False
-    broke_sup = False
-
-    if res is not None:
-        b = check_breakout(df, res, "up", lookback=5, min_rvol=1.2)
-        broke_res = b.get("broken", False)
-    if sup is not None:
-        b = check_breakout(df, sup, "down", lookback=5, min_rvol=1.2)
-        broke_sup = b.get("broken", False)
-
-    return {
-        "label": label,
-        "support": round(sup, 2) if sup else None,
-        "resistance": round(res, 2) if res else None,
-        "price": round(price, 2),
-        "broke_resistance": broke_res,
-        "broke_support": broke_sup,
-    }
-
-
 # ============================================================
 # 5. الدالة الرئيسية
 # ============================================================
 def scan_setup(df_weekly, df_daily, df_4h, df_1h, df_15m):
-    """
-    التسلسل:
-      1. لو اليومي اخترق الأسبوعي → 4H retest
-      2. لو 4H اخترق اليومي → 1H retest
-      3. لو 1H اخترق 4H → 15m retest
-    """
     result = _empty_result()
 
     if df_weekly is None or df_daily is None:
         return result
 
-    # ---------- المستويات ----------
     w_high, w_low = prev_candle_hl(df_weekly, -2)
     d_high, d_low = prev_candle_hl(df_daily, -2)
     h4_high, h4_low = prev_candle_hl(df_4h, -2)
     h1_high, h1_low = prev_candle_hl(df_1h, -2)
 
-    # ============================================================
-    # المرحلة 1: اليومي اخترق الأسبوعي → 4H retest
-    # ============================================================
+    # ═══ المرحلة 1: اليومي اخترق الأسبوعي ═══
     if w_high is not None:
         daily_break_up = check_breakout(df_daily, w_high, "up")
         if daily_break_up.get("broken"):
-            # 4H retest
             retest = check_retest(df_4h, w_high, "up")
             methods = detect_entry_methods(df_4h, w_high, "up")
-
             if retest.get("retested") and methods:
                 return _build_confirmed(
-                    direction="call",
-                    stage="daily_break_weekly",
-                    break_info=daily_break_up,
-                    retest=retest,
-                    methods=methods,
-                    df_w=df_weekly, df_d=df_daily, df_4=df_4h, df_1=df_1h,
-                    w_high=w_high, w_low=w_low,
-                    d_high=d_high, d_low=d_low,
-                    h4_high=h4_high, h4_low=h4_low,
-                    h1_high=h1_high, h1_low=h1_low,
+                    direction="call", stage="daily_break_weekly",
+                    break_info=daily_break_up, retest=retest, methods=methods,
+                    df_w=df_weekly, df_d=df_daily, df_4=df_4h, df_1=df_1h, df_15=df_15m,
+                    w_high=w_high, w_low=w_low, d_high=d_high, d_low=d_low,
+                    h4_high=h4_high, h4_low=h4_low, h1_high=h1_high, h1_low=h1_low,
                 )
-            elif retest.get("status") == "waiting" and daily_break_up.get("candles_since", 999) <= MAX_RETEST_CANDLES:
-                result["status"] = "waiting_retest"
-                result["breakout_stage"] = "daily_break_weekly_up"
 
     if w_low is not None:
         daily_break_dn = check_breakout(df_daily, w_low, "down")
@@ -371,21 +305,14 @@ def scan_setup(df_weekly, df_daily, df_4h, df_1h, df_15m):
             methods = detect_entry_methods(df_4h, w_low, "down")
             if retest.get("retested") and methods:
                 return _build_confirmed(
-                    direction="put",
-                    stage="daily_break_weekly",
-                    break_info=daily_break_dn,
-                    retest=retest,
-                    methods=methods,
-                    df_w=df_weekly, df_d=df_daily, df_4=df_4h, df_1=df_1h,
-                    w_high=w_high, w_low=w_low,
-                    d_high=d_high, d_low=d_low,
-                    h4_high=h4_high, h4_low=h4_low,
-                    h1_high=h1_high, h1_low=h1_low,
+                    direction="put", stage="daily_break_weekly",
+                    break_info=daily_break_dn, retest=retest, methods=methods,
+                    df_w=df_weekly, df_d=df_daily, df_4=df_4h, df_1=df_1h, df_15=df_15m,
+                    w_high=w_high, w_low=w_low, d_high=d_high, d_low=d_low,
+                    h4_high=h4_high, h4_low=h4_low, h1_high=h1_high, h1_low=h1_low,
                 )
 
-    # ============================================================
-    # المرحلة 2: 4H اخترق اليومي → 1H retest
-    # ============================================================
+    # ═══ المرحلة 2: 4H اخترق اليومي ═══
     if d_high is not None:
         h4_break_up = check_breakout(df_4h, d_high, "up")
         if h4_break_up.get("broken"):
@@ -393,16 +320,11 @@ def scan_setup(df_weekly, df_daily, df_4h, df_1h, df_15m):
             methods = detect_entry_methods(df_1h, d_high, "up")
             if retest.get("retested") and methods:
                 return _build_confirmed(
-                    direction="call",
-                    stage="4h_break_daily",
-                    break_info=h4_break_up,
-                    retest=retest,
-                    methods=methods,
-                    df_w=df_weekly, df_d=df_daily, df_4=df_4h, df_1=df_1h,
-                    w_high=w_high, w_low=w_low,
-                    d_high=d_high, d_low=d_low,
-                    h4_high=h4_high, h4_low=h4_low,
-                    h1_high=h1_high, h1_low=h1_low,
+                    direction="call", stage="4h_break_daily",
+                    break_info=h4_break_up, retest=retest, methods=methods,
+                    df_w=df_weekly, df_d=df_daily, df_4=df_4h, df_1=df_1h, df_15=df_15m,
+                    w_high=w_high, w_low=w_low, d_high=d_high, d_low=d_low,
+                    h4_high=h4_high, h4_low=h4_low, h1_high=h1_high, h1_low=h1_low,
                 )
 
     if d_low is not None:
@@ -412,23 +334,16 @@ def scan_setup(df_weekly, df_daily, df_4h, df_1h, df_15m):
             methods = detect_entry_methods(df_1h, d_low, "down")
             if retest.get("retested") and methods:
                 return _build_confirmed(
-                    direction="put",
-                    stage="4h_break_daily",
-                    break_info=h4_break_dn,
-                    retest=retest,
-                    methods=methods,
-                    df_w=df_weekly, df_d=df_daily, df_4=df_4h, df_1=df_1h,
-                    w_high=w_high, w_low=w_low,
-                    d_high=d_high, d_low=d_low,
-                    h4_high=h4_high, h4_low=h4_low,
-                    h1_high=h1_high, h1_low=h1_low,
+                    direction="put", stage="4h_break_daily",
+                    break_info=h4_break_dn, retest=retest, methods=methods,
+                    df_w=df_weekly, df_d=df_daily, df_4=df_4h, df_1=df_1h, df_15=df_15m,
+                    w_high=w_high, w_low=w_low, d_high=d_high, d_low=d_low,
+                    h4_high=h4_high, h4_low=h4_low, h1_high=h1_high, h1_low=h1_low,
                 )
 
-    # ============================================================
-    # المرحلة 3: 1H اخترق 4H → 15m retest
-    # ============================================================
+    # ═══ المرحلة 3: 1H اخترق 4H ═══
     if df_15m is None:
-        df_15m = df_1h  # fallback
+        df_15m = df_1h
 
     if h4_high is not None:
         h1_break_up = check_breakout(df_1h, h4_high, "up")
@@ -437,16 +352,11 @@ def scan_setup(df_weekly, df_daily, df_4h, df_1h, df_15m):
             methods = detect_entry_methods(df_15m, h4_high, "up")
             if retest.get("retested") and methods:
                 return _build_confirmed(
-                    direction="call",
-                    stage="1h_break_4h",
-                    break_info=h1_break_up,
-                    retest=retest,
-                    methods=methods,
-                    df_w=df_weekly, df_d=df_daily, df_4=df_4h, df_1=df_1h,
-                    w_high=w_high, w_low=w_low,
-                    d_high=d_high, d_low=d_low,
-                    h4_high=h4_high, h4_low=h4_low,
-                    h1_high=h1_high, h1_low=h1_low,
+                    direction="call", stage="1h_break_4h",
+                    break_info=h1_break_up, retest=retest, methods=methods,
+                    df_w=df_weekly, df_d=df_daily, df_4=df_4h, df_1=df_1h, df_15=df_15m,
+                    w_high=w_high, w_low=w_low, d_high=d_high, d_low=d_low,
+                    h4_high=h4_high, h4_low=h4_low, h1_high=h1_high, h1_low=h1_low,
                 )
 
     if h4_low is not None:
@@ -456,21 +366,14 @@ def scan_setup(df_weekly, df_daily, df_4h, df_1h, df_15m):
             methods = detect_entry_methods(df_15m, h4_low, "down")
             if retest.get("retested") and methods:
                 return _build_confirmed(
-                    direction="put",
-                    stage="1h_break_4h",
-                    break_info=h1_break_dn,
-                    retest=retest,
-                    methods=methods,
-                    df_w=df_weekly, df_d=df_daily, df_4=df_4h, df_1=df_1h,
-                    w_high=w_high, w_low=w_low,
-                    d_high=d_high, d_low=d_low,
-                    h4_high=h4_high, h4_low=h4_low,
-                    h1_high=h1_high, h1_low=h1_low,
+                    direction="put", stage="1h_break_4h",
+                    break_info=h1_break_dn, retest=retest, methods=methods,
+                    df_w=df_weekly, df_d=df_daily, df_4=df_4h, df_1=df_1h, df_15=df_15m,
+                    w_high=w_high, w_low=w_low, d_high=d_high, d_low=d_low,
+                    h4_high=h4_high, h4_low=h4_low, h1_high=h1_high, h1_low=h1_low,
                 )
 
-    # ============================================================
-    # إذا لا شيء تحقق — نعرض حالة كل إطار
-    # ============================================================
+    # ═══ لا شيء — نعرض لقطات الإطارات ═══
     result["support_resistance"] = {
         "weekly": {"support": round(w_low, 2) if w_low else None,
                    "resistance": round(w_high, 2) if w_high else None},
@@ -483,11 +386,11 @@ def scan_setup(df_weekly, df_daily, df_4h, df_1h, df_15m):
     }
 
     result["timeframes"] = [
-        _tf_snapshot(df_weekly, "1W", None, None),
-        _tf_snapshot(df_daily,  "1D", w_high, w_low),
-        _tf_snapshot(df_4h,     "4H", d_high, d_low),
-        _tf_snapshot(df_1h,     "1H", h4_high, h4_low),
-        _tf_snapshot(df_15m,    "15M", h1_high, h1_low),
+        _tf_snapshot(df_weekly, "1W"),
+        _tf_snapshot(df_daily,  "1D"),
+        _tf_snapshot(df_4h,     "4H"),
+        _tf_snapshot(df_1h,     "1H"),
+        _tf_snapshot(df_15m,    "15M"),
     ]
 
     return result
@@ -497,23 +400,18 @@ def scan_setup(df_weekly, df_daily, df_4h, df_1h, df_15m):
 # 6. بناء النتيجة المؤكدة
 # ============================================================
 def _build_confirmed(direction, stage, break_info, retest, methods,
-                     df_w, df_d, df_4, df_1,
+                     df_w, df_d, df_4, df_1, df_15,
                      w_high, w_low, d_high, d_low, h4_high, h4_low,
                      h1_high, h1_low):
-    """يبني البطاقة عند تحقق الإشارة"""
-    # اختيار أفضل طريقة دخول (الأولى في القائمة)
     best_method = methods[0]
-
     entry = best_method["entry"]
     level = retest["level"]
 
-    # الهدف
     if direction == "call":
         target = break_info.get("peak_after", entry)
     else:
         target = break_info.get("trough_after", entry)
 
-    # الوقف
     atr_val = float(atr(df_4, 14).iloc[-1])
     if direction == "call":
         stop = level - 0.5 * atr_val
@@ -526,17 +424,13 @@ def _build_confirmed(direction, stage, break_info, retest, methods,
 
     rr = round(reward / risk, 2) if risk > 0 else 0
 
-    # اللون
     color = "green" if direction == "call" else "red"
     label = "تأكيد CALL" if direction == "call" else "تأكيد PUT"
-
-    # الحالة
-    status = "confirmed"
 
     result = {
         "color": color,
         "label": label,
-        "status": status,
+        "status": "confirmed",
         "direction": direction,
         "breakout_stage": stage,
         "levels": {
@@ -560,12 +454,12 @@ def _build_confirmed(direction, stage, break_info, retest, methods,
         },
     }
 
-    # لقطات الإطارات
     result["timeframes"] = [
-        _tf_snapshot(df_w, "1W", None, None),
-        _tf_snapshot(df_d, "1D", w_high, w_low),
-        _tf_snapshot(df_4, "4H", d_high, d_low),
-        _tf_snapshot(df_1, "1H", h4_high, h4_low),
+        _tf_snapshot(df_w, "1W"),
+        _tf_snapshot(df_d, "1D"),
+        _tf_snapshot(df_4, "4H"),
+        _tf_snapshot(df_1, "1H"),
+        _tf_snapshot(df_15, "15M"),
     ]
 
     return result
