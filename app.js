@@ -1,16 +1,45 @@
 /* ============================================================
    app.js — Longbridge Scanner
    زر مسح + مراقبة + شارات الحالة + زر حذف
+   البطاقات تتراكم — لا تختفي عند مسح جديد
    ============================================================ */
 const API_BASE = window.location.origin;
 
 let currentScan = null;
 let scanCards = [];
 let scanTimer = null;
-let monitorTimers = new Map();   // { symbol: intervalId }
+let monitorTimers = new Map();
 let activeFilter = "all";
 let lastAlertedState = {};
-let deletedSymbols = new Set();  // لتجنب إعادة الإضافة
+
+// ✅ الرموز المحذوفة يدوياً — لا تعود أبداً
+let deletedSymbols = new Set();
+
+// ✅ حفظ المحذوفات في localStorage
+function saveDeleted() {
+  try {
+    localStorage.setItem("scanner_deleted", JSON.stringify([...deletedSymbols]));
+  } catch (e) {}
+}
+function loadDeleted() {
+  try {
+    const r = localStorage.getItem("scanner_deleted");
+    if (r) deletedSymbols = new Set(JSON.parse(r));
+  } catch (e) {}
+}
+
+// ✅ حفظ البطاقات في localStorage
+function saveCards() {
+  try {
+    localStorage.setItem("scanner_cards", JSON.stringify(scanCards));
+  } catch (e) {}
+}
+function loadCards() {
+  try {
+    const r = localStorage.getItem("scanner_cards");
+    return r ? JSON.parse(r) : [];
+  } catch (e) { return []; }
+}
 
 const cardsArea = document.getElementById("cardsArea");
 const emptyState = document.getElementById("emptyState");
@@ -95,7 +124,6 @@ function trendLabel(t) {
   return "محايد —";
 }
 
-/* ===== ترجمة حالة المراقبة ===== */
 function monitorStatusLabel(s) {
   if (s === "target_hit") return { label: "✅ هدف", cls: "ms-target" };
   if (s === "stop_hit")   return { label: "❌ وقف",  cls: "ms-stop" };
@@ -223,7 +251,6 @@ function updateAllDynamic(root, sym, card) {
   updateWhalesData(root, sym, card.whales || []);
 }
 
-/* ===== الشريط السفلي ===== */
 function buildSummaryBar(cardData) {
   const c = cardData.card || {};
   const color = c.color || "gray";
@@ -253,7 +280,6 @@ function buildSummaryBar(cardData) {
   `;
 }
 
-/* ===== بناء البطاقة ===== */
 function buildCard(cardData) {
   const c = cardData.card || {};
   const lv = cardData.levels || {};
@@ -365,13 +391,11 @@ function buildCard(cardData) {
   div.innerHTML = row1 + row2 + row3 + expanded;
   updateAllDynamic(div, sym, cardData);
 
-  // ✅ فتح/إغلاق البطاقة
   div.addEventListener("click", (e) => {
     if (e.target.closest("[data-trash]")) return;
     div.classList.toggle("open");
   });
 
-  // ✅ حذف البطاقة
   div.querySelector("[data-trash]").addEventListener("click", async (e) => {
     e.stopPropagation();
     await deleteCard(sym);
@@ -382,22 +406,20 @@ function buildCard(cardData) {
 
 /* ===== حذف البطاقة ===== */
 async function deleteCard(symbol) {
-  // احذف من المصفوفة
   scanCards = scanCards.filter(c => c.symbol !== symbol);
   deletedSymbols.add(symbol);
+  saveDeleted();
+  saveCards();
 
-  // أوقف المراقبة
   try {
     await fetch(`${API_BASE}/api/monitor/${symbol}/remove`, { method: "POST" });
   } catch (e) {}
 
-  // أوقف timers الخاصة بالبطاقة
   if (monitorTimers.has(symbol)) {
     clearInterval(monitorTimers.get(symbol));
     monitorTimers.delete(symbol);
   }
 
-  // أعد الرسم
   renderCards();
 }
 
@@ -441,9 +463,10 @@ async function startScan() {
 
   progressWrap.style.display = "block";
   filterSection.style.display = "block";
-  scanCards = [];
-  deletedSymbols.clear();
-  renderCards();
+
+  // ✅ لا نحذف scanCards القديمة
+  // ✅ لا نحذف deletedSymbols
+
   progressFill.style.width = "0%";
   progressText.textContent = "0 / 100";
   progressFound.textContent = "0 فرص";
@@ -475,6 +498,46 @@ function resetScanButton() {
   scanBtn.querySelector(".scan-btn-text").textContent = "ابدأ المسح";
 }
 
+/* ✅ دمج نتائج المسح الجديد مع القديمة */
+function mergeScanResults(newResults) {
+  // خريطة الرموز الحالية
+  const existingMap = new Map(scanCards.map(c => [c.symbol, c]));
+
+  newResults.forEach(newCard => {
+    const sym = newCard.symbol;
+
+    // تجاهل المحذوفات
+    if (deletedSymbols.has(sym)) return;
+
+    const existing = existingMap.get(sym);
+    if (existing) {
+      // ✅ حدّث البطاقة الموجودة (احتفظ بحالة المراقبة)
+      existing.card = newCard.card;
+      existing.levels = newCard.levels;
+      existing.timeframes = newCard.timeframes;
+      existing.price = newCard.price;
+      existing.vwap = newCard.vwap;
+      existing.supports = newCard.supports;
+      existing.resistances = newCard.resistances;
+      existing.call_oi = newCard.call_oi;
+      existing.put_oi = newCard.put_oi;
+      existing.total_call_oi = newCard.total_call_oi;
+      existing.total_put_oi = newCard.total_put_oi;
+      existing.total_call_vol = newCard.total_call_vol;
+      existing.total_put_vol = newCard.total_put_vol;
+      existing.whales = newCard.whales;
+      // monitor_status يبقى كما هو من السيرفر
+      existing.monitor_status = newCard.monitor_status || existing.monitor_status;
+    } else {
+      // ✅ بطاقة جديدة
+      scanCards.push(newCard);
+    }
+  });
+
+  saveCards();
+  renderCards();
+}
+
 async function pollScanProgress() {
   if (!currentScan) return;
 
@@ -488,12 +551,8 @@ async function pollScanProgress() {
     progressText.textContent = `${d.completed} / ${d.total}`;
     progressFound.textContent = `${d.found} فرص`;
 
-    const oldCount = scanCards.length;
-    scanCards = d.results || [];
-
-    if (scanCards.length !== oldCount) {
-      renderCards();
-    }
+    // ✅ دمج بدل استبدال
+    mergeScanResults(d.results || []);
 
     if (d.status === "done" || d.status === "cancelled") {
       clearInterval(scanTimer);
@@ -503,12 +562,6 @@ async function pollScanProgress() {
       progressWrap.style.display = d.status === "done" ? "none" : "block";
       filterSection.style.display = "block";
 
-      if (d.status === "done" && scanCards.length === 0) {
-        emptyState.innerHTML = "<p>لم توجد فرص مطابقة للاستراتيجية</p>";
-        emptyState.style.display = "block";
-      }
-
-      // ✅ ابدأ المراقبة اللحظية
       startMonitoring();
     }
   } catch (e) {}
@@ -524,9 +577,7 @@ scanCancelBtn.addEventListener("click", async () => {
   } catch (e) {}
 });
 
-/* ============================================================
-   ✅ المراقبة اللحظية للبطاقات
-   ============================================================ */
+/* ===== المراقبة اللحظية ===== */
 function startMonitoring() {
   // أوقف أي مراقبة سابقة
   monitorTimers.forEach(t => clearInterval(t));
@@ -534,8 +585,9 @@ function startMonitoring() {
 
   scanCards.forEach(card => {
     const sym = card.symbol;
-    fetchMonitorStatus(sym);  // أول استدعاء
-    // كل 30 ثانية
+    if (deletedSymbols.has(sym)) return;
+
+    fetchMonitorStatus(sym);
     const timer = setInterval(() => fetchMonitorStatus(sym), 30000);
     monitorTimers.set(sym, timer);
   });
@@ -545,22 +597,16 @@ async function fetchMonitorStatus(symbol) {
   if (deletedSymbols.has(symbol)) return;
 
   try {
-    // 1) السعر اللحظي
     const priceRes = await fetch(`${API_BASE}/api/price/${symbol}`);
     if (priceRes.ok) {
       const pData = await priceRes.json();
-      if (pData.price) {
-        updateCardPrice(symbol, pData.price);
-      }
+      if (pData.price) updateCardPrice(symbol, pData.price);
     }
 
-    // 2) حالة المراقبة
     const mRes = await fetch(`${API_BASE}/api/monitor/${symbol}`);
     if (mRes.ok) {
       const m = await mRes.json();
-      if (m.monitored) {
-        updateCardMonitorStatus(symbol, m);
-      }
+      if (m.monitored) updateCardMonitorStatus(symbol, m);
     }
   } catch (e) {}
 }
@@ -568,13 +614,11 @@ async function fetchMonitorStatus(symbol) {
 function updateCardPrice(symbol, price) {
   const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
   if (!cardEl) return;
-
   const priceEl = cardEl.querySelector("[data-price]");
   if (priceEl) priceEl.textContent = "$" + parseFloat(price).toFixed(2);
   const btmPrice = cardEl.querySelector("[data-btm-price]");
   if (btmPrice) btmPrice.textContent = "$" + parseFloat(price).toFixed(2);
 
-  // حدّث في المصفوفة
   const card = scanCards.find(c => c.symbol === symbol);
   if (card) card.price = parseFloat(price);
 }
@@ -589,11 +633,9 @@ function updateCardMonitorStatus(symbol, m) {
 
   const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
   if (!cardEl) return;
-
   const badgeCell = cardEl.querySelector(".badge-cell");
   if (!badgeCell) return;
 
-  // احذف الشارة القديمة
   const old = badgeCell.querySelector(".monitor-badge");
   if (old) old.remove();
 
@@ -608,6 +650,21 @@ function updateCardMonitorStatus(symbol, m) {
 
 /* ===== التهيئة ===== */
 (function init() {
+  // استرجاع البطاقات المحفوظة
+  scanCards = loadCards();
+  loadDeleted();
+
+  // استبعد المحذوفات
+  scanCards = scanCards.filter(c => !deletedSymbols.has(c.symbol));
+
+  renderCards();
+
+  // شغّل المراقبة للبطاقات الموجودة
+  if (scanCards.length > 0) {
+    startMonitoring();
+    filterSection.style.display = "block";
+  }
+
   fetch(`${API_BASE}/api/symbols`)
     .then(r => r.json())
     .then(d => { totalSymbols.textContent = d.total; })
