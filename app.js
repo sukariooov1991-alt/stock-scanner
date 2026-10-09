@@ -1,9 +1,6 @@
 /* ============================================================
    app.js — Longbridge Scanner
-   الاستراتيجية: اختراق متسلسل + Retest
-   - لا فلاتر (كل البطاقات معاً)
-   - المربعات: دعم/مقاومة/حالة اختراق
-   - بدون شريط الدعوم السفلي
+   بدون وميض + Polling سعر مستقل + مربعات دعم/مقاومة
    ============================================================ */
 const API_BASE = window.location.origin;
 
@@ -11,14 +8,13 @@ let currentScan = null;
 let scanCards = [];
 let scanTimer = null;
 let monitorTimers = new Map();
+let pricePollTimer = null;
 let lastAlertedState = {};
 let deletedSymbols = new Set();
 
 /* ===== Storage ===== */
 function saveDeleted() {
-  try {
-    localStorage.setItem("scanner_deleted", JSON.stringify([...deletedSymbols]));
-  } catch (e) {}
+  try { localStorage.setItem("scanner_deleted", JSON.stringify([...deletedSymbols])); } catch (e) {}
 }
 function loadDeleted() {
   try {
@@ -27,9 +23,7 @@ function loadDeleted() {
   } catch (e) {}
 }
 function saveCards() {
-  try {
-    localStorage.setItem("scanner_cards", JSON.stringify(scanCards));
-  } catch (e) {}
+  try { localStorage.setItem("scanner_cards", JSON.stringify(scanCards)); } catch (e) {}
 }
 function loadCards() {
   try {
@@ -62,7 +56,7 @@ function applyTheme(light) {
 themeBtn.addEventListener("click", () => applyTheme(!document.body.classList.contains("light")));
 applyTheme(localStorage.getItem("theme") === "light");
 
-/* ===== Market Status ===== */
+/* ===== Market ===== */
 function updateMarketStatus() {
   const now = new Date();
   const nyH = (now.getUTCHours() - 4 + 24) % 24;
@@ -130,7 +124,7 @@ function monitorStatusLabel(s) {
   return { label: "", cls: "" };
 }
 
-/* ===== OI Block (unchanged) ===== */
+/* ===== OI Block ===== */
 function buildOIBlockStatic(title, kind, color) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
@@ -159,7 +153,7 @@ function updateOIBlockData(root, kind, data) {
   }
 }
 
-/* ===== Whales (unchanged) ===== */
+/* ===== Whales ===== */
 function buildWhalesStatic(sym) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
@@ -214,7 +208,7 @@ function updateWhalesData(root, sym, whales) {
   }
 }
 
-/* ===== Put/Call Boxes (unchanged) ===== */
+/* ===== Put/Call Boxes ===== */
 function updatePutCallBoxes(root, sym, card) {
   const callOI = card.call_oi || [];
   const putOI  = card.put_oi  || [];
@@ -235,18 +229,14 @@ function updatePutCallBoxes(root, sym, card) {
   set("pcbox-put-vol",  putVolTxt);
 }
 
-/* ============================================================
-   ✅ مربع الإطار — دعم / مقاومة / حالة الاختراق
-   ============================================================ */
+/* ===== TF Box ===== */
 function buildTFBox(tf) {
   const label = tf.label || "—";
   const support = tf.support;
   const resistance = tf.resistance;
-  const price = tf.price;
   const brokeRes = !!tf.broke_resistance;
   const brokeSup = !!tf.broke_support;
 
-  // تحديد الحالة
   let statusHtml = "";
   let boxClass = "tf-cell neutral";
 
@@ -262,22 +252,18 @@ function buildTFBox(tf) {
 
   const supTxt = support != null ? `$${support.toFixed(2)}` : "—";
   const resTxt = resistance != null ? `$${resistance.toFixed(2)}` : "—";
-  const priceTxt = price != null ? `$${price.toFixed(2)}` : "—";
 
   return `
     <div class="${boxClass}">
       <div class="tf-label"><span>${label}</span></div>
       <div class="tf-line"><span class="tf-k">مقاومة</span><span class="tf-v">${resTxt}</span></div>
       <div class="tf-line"><span class="tf-k">دعم</span><span class="tf-v">${supTxt}</span></div>
-      <div class="tf-line tf-price"><span class="tf-k">السعر</span><span class="tf-v">${priceTxt}</span></div>
       ${statusHtml}
     </div>
   `;
 }
 
-/* ============================================================
-   ✅ الشريط السفلي المُبسّط
-   ============================================================ */
+/* ===== Summary Bar ===== */
 function buildSummaryBar(cardData) {
   const c = cardData.card || {};
   const color = c.color || "gray";
@@ -295,9 +281,7 @@ function buildSummaryBar(cardData) {
   `;
 }
 
-/* ============================================================
-   ✅ بناء البطاقة
-   ============================================================ */
+/* ===== Build Card ===== */
 function buildCard(cardData) {
   const c = cardData.card || {};
   const lv = cardData.levels || {};
@@ -317,7 +301,6 @@ function buildCard(cardData) {
     ? `<span class="monitor-badge ${ms.cls}">${ms.label}</span>`
     : "";
 
-  /* ===== Row 1 ===== */
   const row1 = `<div class="card-row row-1">
     <div class="cell symbol-cell">${sym}</div>
     <div class="cell price-cell">
@@ -340,7 +323,6 @@ function buildCard(cardData) {
     </div>
   </div>`;
 
-  /* ===== Row 2: العقد ===== */
   const row2 = `<div class="card-row row-2">
     <div class="cell"><div class="label">الأيام</div><div class="val">${lv.dte || "—"}</div></div>
     <div class="cell"><div class="label">سعر العقد</div><div class="val">${lv.premium && lv.premium !== "—" ? "$" + lv.premium : "—"}</div></div>
@@ -348,7 +330,6 @@ function buildCard(cardData) {
     <div class="cell"><div class="label">التنفيذ</div><div class="val">${lv.strike || "—"}</div></div>
   </div>`;
 
-  /* ===== Row 3: المستويات ===== */
   const row3 = `<div class="card-row row-3">
     <div class="cell"><div class="label">الوقف</div><div class="val">${lv.stop ? "$" + lv.stop : "—"}</div></div>
     <div class="cell"><div class="label">R:R</div><div class="val">${lv.rr || "—"}</div></div>
@@ -356,11 +337,9 @@ function buildCard(cardData) {
     <div class="cell"><div class="label">الدخول</div><div class="val">${lv.entry ? "$" + lv.entry : "—"}</div></div>
   </div>`;
 
-  /* ===== المربعات (5 فريمات) ===== */
   const tfs = cardData.timeframes || [];
   const tfsHtml = tfs.map(t => buildTFBox(t)).join("");
 
-  /* ===== OI + Boxes + Whales ===== */
   const oiHtml = `<div class="oi-grid">
     ${buildOIBlockStatic("مفتوحة - PUT", "put-oi", "#8b5cf6")}
     ${buildOIBlockStatic("سيولة - PUT", "put-liq", "#ef4444")}
@@ -390,7 +369,6 @@ function buildCard(cardData) {
 
   const whalesHtml = buildWhalesStatic(sym);
 
-  /* ===== التوسيع (بدون VWAP/دعوم/مقاومات) ===== */
   const expanded = `<div class="card-expanded">
     <div class="tf-grid">${tfsHtml}</div>
     ${oiHtml}
@@ -415,9 +393,7 @@ function buildCard(cardData) {
   return div;
 }
 
-/* ============================================================
-   تحديث داخلي (بدون إعادة بناء)
-   ============================================================ */
+/* ===== Dynamic Update ===== */
 function updateAllDynamic(root, sym, card) {
   if (!root || !card) return;
   const callOI = card.call_oi || [];
@@ -430,9 +406,57 @@ function updateAllDynamic(root, sym, card) {
   updateWhalesData(root, sym, card.whales || []);
 }
 
-/* ============================================================
-   حذف البطاقة
-   ============================================================ */
+/* ===== Update In Place (بدون وميض) ===== */
+function updateCardInPlace(cardEl, data) {
+  const c = data.card || {};
+  const lv = data.levels || {};
+  const price = data.price ?? 0;
+
+  const wasOpen = cardEl.classList.contains("open");
+  const oldCls = cardEl.className;
+  const newCls = "card " + (c.color || "gray") + (wasOpen ? " open" : "");
+  if (oldCls !== newCls) cardEl.className = newCls;
+
+  const priceEl = cardEl.querySelector("[data-price]");
+  if (priceEl) priceEl.textContent = "$" + price.toFixed(2);
+
+  const scoreEl = cardEl.querySelector("[data-score]");
+  if (scoreEl) scoreEl.textContent = lv.rr ?? "—";
+
+  const badgeEl = cardEl.querySelector("[data-badge]");
+  if (badgeEl) badgeEl.textContent = "🔥 " + (c.label || "—");
+
+  const row2 = cardEl.querySelector(".row-2");
+  if (row2) {
+    const cells = row2.querySelectorAll(".cell .val");
+    if (cells[0]) cells[0].textContent = lv.dte || "—";
+    if (cells[1]) cells[1].textContent = (lv.premium && lv.premium !== "—") ? "$" + lv.premium : "—";
+    if (cells[2]) cells[2].textContent = lv.expiry || "—";
+    if (cells[3]) cells[3].textContent = lv.strike || "—";
+  }
+
+  const row3 = cardEl.querySelector(".row-3");
+  if (row3) {
+    const cells = row3.querySelectorAll(".cell .val");
+    if (cells[0]) cells[0].textContent = lv.stop ? "$" + lv.stop : "—";
+    if (cells[1]) cells[1].textContent = lv.rr || "—";
+    if (cells[2]) cells[2].textContent = lv.target1 ? "$" + lv.target1 : "—";
+    if (cells[3]) cells[3].textContent = lv.entry ? "$" + lv.entry : "—";
+  }
+
+  const tfGrid = cardEl.querySelector(".tf-grid");
+  if (tfGrid) {
+    const tfs = data.timeframes || [];
+    tfGrid.innerHTML = tfs.map(t => buildTFBox(t)).join("");
+  }
+
+  updateAllDynamic(cardEl, data.symbol, data);
+
+  const sumWrap = cardEl.querySelector("[data-summary-wrap]");
+  if (sumWrap) sumWrap.innerHTML = buildSummaryBar(data);
+}
+
+/* ===== Delete Card ===== */
 async function deleteCard(symbol) {
   scanCards = scanCards.filter(c => c.symbol !== symbol);
   deletedSymbols.add(symbol);
@@ -448,23 +472,42 @@ async function deleteCard(symbol) {
     monitorTimers.delete(symbol);
   }
 
-  renderCards();
+  const el = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
+  if (el) el.remove();
+  if (scanCards.length === 0) emptyState.style.display = "block";
 }
 
-/* ============================================================
-   عرض البطاقات
-   ============================================================ */
+/* ===== Render (بدون وميض) ===== */
 function renderCards() {
-  cardsArea.innerHTML = "";
+  const filtered = scanCards
+    .filter(c => !deletedSymbols.has(c.symbol))
+    .sort((a, b) => (b.levels?.rr ?? 0) - (a.levels?.rr ?? 0));
 
-  const filtered = scanCards.filter(c => !deletedSymbols.has(c.symbol));
-  filtered.sort((a, b) => {
-    const sa = a.levels?.rr ?? 0;
-    const sb = b.levels?.rr ?? 0;
-    return sb - sa;
+  // حذف البطاقات المُزالة
+  Array.from(cardsArea.children).forEach(el => {
+    if (el.classList && el.classList.contains("card")) {
+      const sym = el.dataset.symbol;
+      if (!filtered.find(c => c.symbol === sym)) el.remove();
+    }
   });
 
-  filtered.forEach(c => cardsArea.appendChild(buildCard(c)));
+  // إضافة/تحديث
+  filtered.forEach((cardData, idx) => {
+    const sym = cardData.symbol;
+    let el = cardsArea.querySelector(`[data-symbol="${sym}"]`);
+
+    if (el) {
+      updateCardInPlace(el, cardData);
+    } else {
+      el = buildCard(cardData);
+    }
+
+    const current = Array.from(cardsArea.children).filter(c => c.classList && c.classList.contains("card"));
+    if (current[idx] !== el) {
+      if (idx >= current.length) cardsArea.appendChild(el);
+      else cardsArea.insertBefore(el, current[idx]);
+    }
+  });
 
   emptyState.style.display = filtered.length ? "none" : "block";
   if (filtered.length === 0 && scanCards.length > 0) {
@@ -474,16 +517,14 @@ function renderCards() {
   }
 }
 
-/* ============================================================
-   زر المسح
-   ============================================================ */
+/* ===== Scan ===== */
 async function startScan() {
   scanBtn.disabled = true;
   scanBtn.querySelector(".scan-btn-text").textContent = "جاري المسح...";
 
   progressWrap.style.display = "block";
   progressFill.style.width = "0%";
-  progressText.textContent = "0 / 100";
+  progressText.textContent = "0 / 500";
   progressFound.textContent = "0 فرص";
 
   try {
@@ -582,9 +623,7 @@ scanCancelBtn.addEventListener("click", async () => {
   } catch (e) {}
 });
 
-/* ============================================================
-   المراقبة
-   ============================================================ */
+/* ===== Monitoring ===== */
 function startMonitoring() {
   monitorTimers.forEach(t => clearInterval(t));
   monitorTimers.clear();
@@ -596,17 +635,13 @@ function startMonitoring() {
     const timer = setInterval(() => fetchMonitorStatus(sym), 30000);
     monitorTimers.set(sym, timer);
   });
+
+  startPricePolling();
 }
 
 async function fetchMonitorStatus(symbol) {
   if (deletedSymbols.has(symbol)) return;
   try {
-    const priceRes = await fetch(`${API_BASE}/api/price/${symbol}`);
-    if (priceRes.ok) {
-      const pData = await priceRes.json();
-      if (pData.price) updateCardPrice(symbol, pData.price);
-    }
-
     const mRes = await fetch(`${API_BASE}/api/monitor/${symbol}`);
     if (mRes.ok) {
       const m = await mRes.json();
@@ -615,21 +650,10 @@ async function fetchMonitorStatus(symbol) {
   } catch (e) {}
 }
 
-function updateCardPrice(symbol, price) {
-  const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
-  if (!cardEl) return;
-  const priceEl = cardEl.querySelector("[data-price]");
-  if (priceEl) priceEl.textContent = "$" + parseFloat(price).toFixed(2);
-
-  const card = scanCards.find(c => c.symbol === symbol);
-  if (card) card.price = parseFloat(price);
-}
-
 function updateCardMonitorStatus(symbol, m) {
   const card = scanCards.find(c => c.symbol === symbol);
-  if (card) {
-    card.monitor_status = m.status;
-  }
+  if (card) card.monitor_status = m.status;
+
   const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
   if (!cardEl) return;
   const badgeCell = cardEl.querySelector(".badge-cell");
@@ -647,9 +671,33 @@ function updateCardMonitorStatus(symbol, m) {
   }
 }
 
-/* ============================================================
-   التهيئة
-   ============================================================ */
+/* ===== Price Polling (مستقل) ===== */
+async function pollPrices() {
+  for (const card of scanCards) {
+    if (deletedSymbols.has(card.symbol)) continue;
+    try {
+      const r = await fetch(`${API_BASE}/api/price/${card.symbol}`);
+      if (!r.ok) continue;
+      const d = await r.json();
+      if (d.price) {
+        card.price = d.price;
+        const el = cardsArea.querySelector(`[data-symbol="${card.symbol}"]`);
+        if (el) {
+          const priceEl = el.querySelector("[data-price]");
+          if (priceEl) priceEl.textContent = "$" + parseFloat(d.price).toFixed(2);
+        }
+      }
+    } catch (e) {}
+  }
+}
+
+function startPricePolling() {
+  if (pricePollTimer) return;
+  setTimeout(pollPrices, 1000);
+  pricePollTimer = setInterval(pollPrices, 5000);
+}
+
+/* ===== Init ===== */
 (function init() {
   scanCards = loadCards();
   loadDeleted();
