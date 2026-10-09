@@ -54,7 +54,8 @@ MONITOR_DAYS = 10
 MONITOR_INTERVAL = 60
 MAX_CONCURRENT = 5
 
-SCAN_SYMBOLS = [
+# ✅ FIX #11 + #12: حذف الرموز المحذوفة + منع التكرار مع الحفاظ على الترتيب
+SCAN_SYMBOLS = list(dict.fromkeys([
     "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "NVDA", "META", "BRK-B", "TSLA", "AVGO",
     "WMT", "LLY", "JPM", "V", "UNH", "XOM", "MA", "ORCL", "COST", "HD",
     "PG", "JNJ", "NFLX", "ABBV", "BAC", "CRM", "TMUS", "CVX", "AMD", "KO",
@@ -73,8 +74,8 @@ SCAN_SYMBOLS = [
     "JKHY", "FFIV", "AKAM", "JNPR", "MSI", "APH", "TEL", "GLW", "KEYS",
     "HUM", "HCA", "MCK", "ABC", "CAH", "DGX", "LH", "BAX", "BDX", "BIIB",
     "ILMN", "IDXX", "A", "MTD", "WAT", "RMD", "HOLX", "COO", "EW", "DXCM",
-    "PODD", "ALGN", "ZBH", "ABMD", "TFX", "STE", "XRAY", "ALC", "CRL", "IQV",
-    "PKI", "RVTY", "BIO", "TECH", "QGEN", "MOH", "CNC", "WCG", "ALHC", "OSCR",
+    "PODD", "ALGN", "ZBH", "TFX", "STE", "XRAY", "ALC", "CRL", "IQV",
+    "PKI", "RVTY", "BIO", "TECH", "QGEN", "MOH", "CNC", "ALHC", "OSCR",
     "CLOV", "HIMS", "DOCS", "VEEV", "TDOC", "AMWL", "ONEM", "PHR", "HCTI", "CERT",
     "EVH", "PGNY", "ACCD", "GDRX", "HNGR",
     "USB", "PNC", "TFC", "MTB", "FITB", "HBAN", "RF", "KEY", "CFG", "STT",
@@ -104,7 +105,7 @@ SCAN_SYMBOLS = [
     "CMS", "CNP", "NI", "AES", "NRG", "VST", "CEG", "PSEG", "PNW", "LNT",
     "EVRG", "OGE", "PCG", "EIX", "AWK", "WTRG", "SJW", "CWT", "MSEX", "YORW",
     "ARTNA",
-]
+]))
 
 _scans: dict[str, dict] = {}
 _SCAN_TTL = 3600
@@ -449,13 +450,15 @@ def analyze_symbol(symbol: str) -> dict:
 
     levels = scan.get("levels", {}) or {}
 
-    # ✅ جلب الخيارات (دائماً — حتى لو لا عقد مناسب، لجلب OI/Volume/Whales)
-    direction_opt = "bullish" if scan["color"] == "green" else "bearish"
-    if scan["color"] in ("green", "red"):
-        opt = fetch_option_data(symbol, direction_opt, price, "swing")
+    # ✅ FIX #7: للبطاقات الرمادية نختار الاتجاه حسب حركة السعر (وليس "bullish" ثابت)
+    if scan["color"] == "green":
+        direction_opt = "bullish"
+    elif scan["color"] == "red":
+        direction_opt = "bearish"
     else:
-        # للبطاقات الرمادية — نجلب OI/Volume على أي حال
-        opt = fetch_option_data(symbol, "bullish", price, "swing")
+        direction_opt = "bullish" if price >= prev_close else "bearish"
+
+    opt = fetch_option_data(symbol, direction_opt, price, "swing")
 
     levels["strike"]  = opt.get("strike", "—")
     levels["expiry"]  = opt.get("expiry", "—")
