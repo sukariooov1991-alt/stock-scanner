@@ -66,7 +66,7 @@ SCAN_SYMBOLS = [
 # حالة المسح (in-memory)
 # ============================================================
 _scans: dict[str, dict] = {}
-_SCAN_TTL = 3600  # ساعة كاملة
+_SCAN_TTL = 3600
 
 
 def get_ctx():
@@ -438,40 +438,27 @@ async def run_scan(scan_id: str):
             return
 
         try:
-            # ✅ تخطى أي سهم تم تحليله مسبقاً
             if sym in scan["results_map"]:
                 continue
 
             data = await asyncio.to_thread(analyze_symbol, sym)
 
-            # خزّن النتيجة
             scan["results_map"][sym] = data
 
             card = data.get("card", {})
             color = card.get("color", "gray")
 
-            # ✅ اجمع فقط الفرص (أخضر/أحمر/أصفر)
-            if color in ("green", "red", "yellow"):
+            # ✅ اجمع فقط CALL/PUT المؤكدة
+            if color in ("green", "red"):
                 scan["results"].append(data)
 
             scan["completed"] = i + 1
-
-            # ✅ إرسال تنبيه Telegram عند إشارة قوية
-            if color in ("green", "red"):
-                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                alert_key = f"{sym}:{color}:{today}"
-                if alert_key not in _sent_alerts:
-                    msg = build_alert_message(data)
-                    if msg:
-                        await asyncio.to_thread(send_telegram_alert, msg)
-                        _sent_alerts.add(alert_key)
 
         except Exception as e:
             print(f"[SCAN] {sym} error: {e}", flush=True)
             scan["errors"].append({"symbol": sym, "error": str(e)})
             scan["completed"] = i + 1
 
-        # ✅ تأخير بسيط لتجنب rate limit
         await asyncio.sleep(0.15)
 
     scan["status"] = "done"
@@ -479,36 +466,7 @@ async def run_scan(scan_id: str):
     print(f"[SCAN] {scan_id} done — found {len(scan['results'])} opportunities", flush=True)
 
 
-def build_alert_message(data):
-    sym = data["symbol"]; price = data["price"]
-    card = data.get("card", {}); lv = data.get("levels", {})
-    color = card.get("color", "gray")
-    if color not in ("green", "red"): return ""
-    header = f"🟢 <b>إشارة CALL</b> — {sym}" if color == "green" else f"🔴 <b>إشارة PUT</b> — {sym}"
-
-    return f"""{header}
-
-💪 قوة الإشارة: <b>{card.get('score', 0)}%</b>
-💰 السعر: <b>${price}</b>
-
-📊 <b>الاتجاه:</b>
-  • 1W: <b>{card.get('trend_w','—')}</b>
-  • 1D: <b>{card.get('trend_d','—')}</b>
-  • 4H: <b>{card.get('trend_4h','—')}</b>
-
-📋 <b>العقد:</b>
-  • STRIKE: <b>{lv.get('strike','—')}</b>
-  • EXPIRY: <b>{lv.get('expiry','—')}</b> (DTE: {lv.get('dte','—')})
-
-📊 <b>المستويات:</b>
-  • ENTRY: ${lv.get('entry','—')}
-  • STOP: ${lv.get('stop','—')}
-  • TARGET: ${lv.get('target1','—')}
-"""
-
-
 def cleanup_old_scans():
-    """يحذف المسوحات القديمة (أكثر من ساعة)"""
     now = time.time()
     to_delete = []
     for sid, s in _scans.items():
@@ -588,7 +546,6 @@ def get_symbols():
     return {"total": len(SCAN_SYMBOLS), "symbols": SCAN_SYMBOLS}
 
 
-# ✅ بدء مسح جديد
 @app.post("/api/scan/start")
 async def scan_start():
     cleanup_old_scans()
@@ -610,7 +567,6 @@ async def scan_start():
     return {"scan_id": scan_id, "total": len(SCAN_SYMBOLS)}
 
 
-# ✅ حالة المسح
 @app.get("/api/scan/{scan_id}")
 def scan_status(scan_id: str):
     scan = _scans.get(scan_id)
@@ -628,7 +584,6 @@ def scan_status(scan_id: str):
     }
 
 
-# ✅ إلغاء المسح
 @app.post("/api/scan/{scan_id}/cancel")
 def scan_cancel(scan_id: str):
     scan = _scans.get(scan_id)
@@ -638,7 +593,6 @@ def scan_cancel(scan_id: str):
     return {"ok": True}
 
 
-# ✅ آخر مسح
 @app.get("/api/scan/latest")
 def scan_latest():
     if not _scans:
@@ -647,7 +601,6 @@ def scan_latest():
     return scan_status(latest_id)
 
 
-# ✅ تحليل سهم واحد (احتياطي للـ debugging)
 @app.get("/api/analyze/{symbol}")
 def analyze(symbol: str):
     try:
@@ -659,7 +612,6 @@ def analyze(symbol: str):
         })
 
 
-# ✅ السعر اللحظي (للمسح الحي)
 @app.get("/api/price/{symbol}")
 def price_only(symbol: str):
     try:
