@@ -1,6 +1,7 @@
 """
 main.py — Longbridge Options Radar Scanner
 FastAPI + Longbridge + Telegram Alerts + Monitoring
+التحسينات: 1D=400، تأجيل الخيارات، Cache للشموع
 """
 import os
 import time
@@ -42,11 +43,21 @@ _sent_alerts: set[str] = set()
 _analyze_cache: dict[str, tuple[float, dict]] = {}
 _ANALYZE_TTL = 25
 
+# ✅ Cache للشموع
+_candle_cache: dict[str, tuple[float, list]] = {}
+_CANDLE_TTL = {
+    "1w": 3600,   # ساعة كاملة
+    "1d": 3600,   # ساعة كاملة
+    "4h": 900,    # 15 دقيقة
+    "1h": 300,    # 5 دقائق
+}
+_CANDLE_CACHE_MAX = 2000  # حد أقصى لعدد المفاتيح
+
 WHALE_MIN_VOLUME = 3000
 WHALE_MIN_OI     = 5000
 
-MONITOR_DAYS = 10   # مدة المراقبة القصوى
-MONITOR_INTERVAL = 60  # كل 60 ثانية
+MONITOR_DAYS = 10
+MONITOR_INTERVAL = 60
 
 # ============================================================
 # قائمة المسح — 100 سهم
@@ -69,8 +80,6 @@ SCAN_SYMBOLS = [
 # ============================================================
 _scans: dict[str, dict] = {}
 _SCAN_TTL = 3600
-
-# المراقبة: { symbol: { card, entry, target, stop, direction, expires_at, status, alerts_sent } }
 _monitoring: dict[str, dict] = {}
 
 
@@ -115,17 +124,41 @@ PERIOD_MAP = {
 }
 
 
+# ============================================================
+# ✅ fetch_candles — مع Cache
+# ============================================================
 def fetch_candles(symbol, timeframe, count=200):
+    tf = timeframe.lower()
+    key = f"{symbol.upper()}:{tf}:{count}"
+    now = time.time()
+    ttl = _CANDLE_TTL.get(tf, 60)
+
+    if key in _candle_cache:
+        ts, cached = _candle_cache[key]
+        if now - ts < ttl and len(cached) >= count:
+            return cached
+
     ctx = get_ctx()
-    p = PERIOD_MAP.get(timeframe.lower())
+    p = PERIOD_MAP.get(tf)
     if p is None:
         raise ValueError(f"فريم غير مدعوم: {timeframe}")
-    return ctx.candlesticks(norm(symbol), p, count,
-                            AdjustType.NoAdjust,
-                            trade_sessions=TradeSessions.All)
+
+    candles = ctx.candlesticks(norm(symbol), p, count,
+                                AdjustType.NoAdjust,
+                                trade_sessions=TradeSessions.All)
+
+    # حد أقصى لحجم الـ cache
+    if len(_candle_cache) > _CANDLE_CACHE_MAX:
+        # احذف الأقدم
+        oldest = sorted(_candle_cache.items(), key=lambda x: x[1][0])[:500]
+        for k, _ in oldest:
+            _candle_cache.pop(k, None)
+
+    _candle_cache[key] = (now, candles)
+    return candles
 
 
-def get_current_price(symbol: str) -> float | None:
+def get_current_price(symbol: str):
     try:
         ctx = get_ctx()
         sym = norm(symbol)
@@ -163,12 +196,20 @@ def _put_of(c):
     return getattr(po, "symbol", None) if po else None
 
 
+def _empty_option_result():
+    return {
+        "strike": "—", "expiry": "—", "dte": "—", "premium": "—", "delta": None,
+        "call_oi": [], "put_oi": [],
+        "total_call_oi": 0, "total_put_oi": 0,
+        "total_call_vol": 0, "total_put_vol": 0,
+        "whales": [],
+    }
+
+
 def fetch_option_data(symbol, direction, price, strategy="swing"):
     ctx = get_ctx()
     sym = norm(symbol)
-    result = {"strike":"—","expiry":"—","dte":"—","premium":"—","delta":None,
-              "call_oi":[],"put_oi":[],"total_call_oi":0,"total_put_oi":0,
-              "total_call_vol":0,"total_put_vol":0,"whales":[]}
+    result = _empty_option_result()
     try:
         raw_dates = ctx.option_chain_expiry_date_list(sym)
         if not raw_dates: return result
@@ -323,13 +364,14 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
 
 
 # ============================================================
-# analyze_symbol
+# ✅ analyze_symbol — الخيارات مؤجلة بعد الفحص الفني
 # ============================================================
 def analyze_symbol(symbol: str) -> dict:
-    df_weekly = candles_to_df(fetch_candles(symbol, "1w", 200))
-    df_daily  = candles_to_df(fetch_candles(symbol, "1d", 300))
-    df_4h     = candles_to_df(fetch_candles(symbol, "4h", 300))
-    df_1h     = candles_to_df(fetch_candles(symbol, "1h", 300))
+    # ✅ 1) الشموع (مع cache) — العدد الجديد
+    df_weekly = candles_to_df(fetch_candles(symbol, "1w", 150))
+    df_daily  = candles_to_df(fetch_candles(symbol, "1d", 400))
+    df_4h     = candles_to_df(fetch_candles(symbol, "4h", 200))
+    df_1h     = candles_to_df(fetch_candles(symbol, "1h", 200))
 
     def enrich(df):
         df["ema20"] = ema(df["close"], 20)
@@ -345,10 +387,12 @@ def analyze_symbol(symbol: str) -> dict:
     df_4h     = enrich(df_4h)
     df_1h     = enrich(df_1h)
 
+    # ✅ 2) السعر الحالي
     q = get_ctx().quote([norm(symbol)])[0]
     price = float(q.last_done)
     prev_close = float(q.prev_close)
 
+    # ✅ 3) الفحص الفني
     scan = scan_setup(df_weekly, df_daily, df_4h, df_1h)
 
     card = {
@@ -367,6 +411,17 @@ def analyze_symbol(symbol: str) -> dict:
 
     direction = scan["direction"] or "bullish"
     levels = scan["levels"]
+
+    # ✅ 4) جلب الخيارات فقط إذا كانت الإشارة مؤكدة
+    if scan["color"] in ("green", "red"):
+        opt = fetch_option_data(symbol, direction, price, "swing")
+    else:
+        opt = _empty_option_result()
+
+    levels["strike"]  = opt.get("strike", "—")
+    levels["expiry"]  = opt.get("expiry", "—")
+    levels["dte"]     = opt.get("dte", "—")
+    levels["premium"] = opt.get("premium", "—")
 
     def tf_snap(df, label, use_ema200=False):
         ts = trend_status(df, use_ema200=use_ema200)
@@ -387,12 +442,6 @@ def analyze_symbol(symbol: str) -> dict:
         tf_snap(df_4h,     "4H", use_ema200=False),
         tf_snap(df_1h,     "1H", use_ema200=False),
     ]
-
-    opt = fetch_option_data(symbol, direction, price, "swing")
-    levels["strike"]  = opt.get("strike", "—")
-    levels["expiry"]  = opt.get("expiry", "—")
-    levels["dte"]     = opt.get("dte", "—")
-    levels["premium"] = opt.get("premium", "—")
 
     supports = [
         round(float(df_daily["low"].iloc[-20:].min()), 2),
@@ -463,11 +512,9 @@ async def run_scan(scan_id: str):
             card = data.get("card", {})
             color = card.get("color", "gray")
 
-            # ✅ أضف فقط CALL/PUT المؤكدة
             if color in ("green", "red"):
                 scan["results"].append(data)
 
-                # ✅ أضف إلى المراقبة التلقائية
                 levels = data.get("levels", {})
                 entry = levels.get("entry")
                 target = levels.get("target1")
@@ -484,7 +531,7 @@ async def run_scan(scan_id: str):
                         "score": card.get("score", 0),
                         "created_at": time.time(),
                         "expires_at": time.time() + MONITOR_DAYS * 86400,
-                        "status": "active",       # active / target_hit / stop_hit / expired
+                        "status": "active",
                         "alerts_sent": set(),
                         "last_price": float(data.get("price", entry)),
                     }
@@ -497,7 +544,7 @@ async def run_scan(scan_id: str):
             scan["errors"].append({"symbol": sym, "error": str(e)})
             scan["completed"] = i + 1
 
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.05)  # تأخير مخفف — الـ cache يقوم بالعمل
 
     scan["status"] = "done"
     scan["finished_at"] = time.time()
@@ -515,10 +562,9 @@ def cleanup_old_scans():
 
 
 # ============================================================
-# مراقبة البطاقات النشطة
+# مراقبة البطاقات
 # ============================================================
 async def monitor_task():
-    """كل 60 ثانية — يفحص كل بطاقة نشطة"""
     await asyncio.sleep(60)
 
     while True:
@@ -534,15 +580,12 @@ async def monitor_task():
                 if not m:
                     continue
 
-                # ✅ إذا انتهى الأمر — تجاهل
                 if m["status"] != "active":
-                    # إذا انتهت المراقبة > يوم — احذفها تلقائياً
                     if m["status"] in ("target_hit", "stop_hit", "expired"):
                         if now - m.get("ended_at", now) > 86400:
                             _monitoring.pop(sym, None)
                     continue
 
-                # ✅ انتهت المدة؟
                 if now >= m["expires_at"]:
                     m["status"] = "expired"
                     m["ended_at"] = now
@@ -552,7 +595,6 @@ async def monitor_task():
                     )
                     continue
 
-                # ✅ اجلب السعر
                 price = await asyncio.to_thread(get_current_price, sym)
                 if price is None:
                     continue
@@ -562,7 +604,6 @@ async def monitor_task():
                 target = m["target"]
                 stop = m["stop"]
 
-                # ✅ فحص الهدف
                 if "target" not in m["alerts_sent"]:
                     if direction == "call" and price >= target:
                         m["status"] = "target_hit"
@@ -572,8 +613,7 @@ async def monitor_task():
                             send_telegram_alert,
                             f"✅ <b>تحقق الهدف</b> — {sym}\n"
                             f"السعر: ${price:.2f}\n"
-                            f"الهدف: ${target:.2f}\n"
-                            f"الربح: {((price-target)/target*100):.2f}%"
+                            f"الهدف: ${target:.2f}"
                         )
                         continue
                     if direction == "put" and price <= target:
@@ -588,7 +628,6 @@ async def monitor_task():
                         )
                         continue
 
-                # ✅ فحص الوقف
                 if "stop" not in m["alerts_sent"]:
                     if direction == "call" and price <= stop:
                         m["status"] = "stop_hit"
@@ -718,7 +757,6 @@ def scan_status(scan_id: str):
     if not scan:
         return JSONResponse(status_code=404, content={"error": "scan not found"})
 
-    # أضف حالة المراقبة لكل بطاقة
     results = []
     for r in scan["results"]:
         sym = r.get("symbol")
@@ -757,7 +795,6 @@ def scan_latest():
     return scan_status(latest_id)
 
 
-# ✅ حالة المراقبة لبطاقة واحدة (للتحديث اللحظي)
 @app.get("/api/monitor/{symbol}")
 def monitor_status(symbol: str):
     sym = symbol.upper().strip()
@@ -777,7 +814,6 @@ def monitor_status(symbol: str):
     }
 
 
-# ✅ إيقاف المراقبة (عند حذف البطاقة)
 @app.post("/api/monitor/{symbol}/remove")
 def monitor_remove(symbol: str):
     sym = symbol.upper().strip()
@@ -787,7 +823,6 @@ def monitor_remove(symbol: str):
     return {"ok": True}
 
 
-# ✅ جميع البطاقات المُراقَبة
 @app.get("/api/monitoring")
 def get_monitoring():
     return {
@@ -806,6 +841,15 @@ def get_monitoring():
             }
             for s, m in _monitoring.items()
         ],
+    }
+
+
+@app.get("/api/cache-stats")
+def cache_stats():
+    return {
+        "candle_cache_size": len(_candle_cache),
+        "analyze_cache_size": len(_analyze_cache),
+        "monitoring_count": len(_monitoring),
     }
 
 
