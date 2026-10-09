@@ -1,7 +1,7 @@
 """
 main.py — Longbridge Options Radar Scanner
 FastAPI + Longbridge + Telegram Alerts + Monitoring
-التحسينات: 1D=400، تأجيل الخيارات، Cache للشموع
+قائمة 500 سهم + فلتر العقد ($3 / $0.10) + معالجة متوازية
 """
 import os
 import time
@@ -11,7 +11,7 @@ import traceback
 import requests
 import re
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone, date as date_cls, timedelta
+from datetime import datetime, timezone, date as date_cls
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,15 +43,14 @@ _sent_alerts: set[str] = set()
 _analyze_cache: dict[str, tuple[float, dict]] = {}
 _ANALYZE_TTL = 25
 
+# ✅ فلاتر العقد
+MAX_PREMIUM = 3.0
+MAX_SPREAD  = 0.10
+
 # ✅ Cache للشموع
 _candle_cache: dict[str, tuple[float, list]] = {}
-_CANDLE_TTL = {
-    "1w": 3600,   # ساعة كاملة
-    "1d": 3600,   # ساعة كاملة
-    "4h": 900,    # 15 دقيقة
-    "1h": 300,    # 5 دقائق
-}
-_CANDLE_CACHE_MAX = 2000  # حد أقصى لعدد المفاتيح
+_CANDLE_TTL = {"1w": 3600, "1d": 3600, "4h": 900, "1h": 300}
+_CANDLE_CACHE_MAX = 4000
 
 WHALE_MIN_VOLUME = 3000
 WHALE_MIN_OI     = 5000
@@ -59,21 +58,80 @@ WHALE_MIN_OI     = 5000
 MONITOR_DAYS = 10
 MONITOR_INTERVAL = 60
 
+MAX_CONCURRENT = 5   # المعالجة المتوازية
+
 # ============================================================
-# قائمة المسح — 100 سهم
+# قائمة المسح — 500 سهم (ميجا + لارج كاب)
 # ============================================================
 SCAN_SYMBOLS = [
-    "NVDA", "AAPL", "GOOG", "GOOGL", "MSFT", "AMZN", "META", "AVGO", "TSLA", "MU",
-    "AMD", "WMT", "INTC", "ASML", "PLTR", "CSCO", "LRCX", "AMAT", "COST", "PANW",
-    "NFLX", "CRWD", "KLAC", "TXN", "MRVL", "LIN", "AMGN", "ADI", "QCOM", "SHOP",
-    "STX", "GILD", "TMUS", "PEP", "ARM", "WDC", "PDD", "ISRG", "FTNT", "VRTX",
-    "BKNG", "SBUX", "ADP", "DDOG", "CDNS", "ABNB", "SNPS", "ADBE", "MAR", "CEG",
-    "APP", "CSX", "MELI", "MNST", "DASH", "CTAS", "CMCSA", "REGN", "INTU", "MDLZ",
-    "ROST", "MPWR", "ORLY", "HON", "AEP", "MSTR", "TRI", "NXPI", "PCAR", "FAST",
-    "BKR", "EA", "FANG", "TEAM", "MCHP", "PYPL", "CCEP", "XEL", "WDAY", "ADSK",
-    "EXC", "KDP", "IDXX", "TTWO", "ODFL", "PAYX", "ROP", "AXON", "FER", "DXCM",
-    "ZS", "ALNY", "GEHC", "CTSH", "KHC", "CPRT", "INSM", "VRSK", "CHTR", "MRNA",
+    # ═══ ميجا كاب (50) ═══
+    "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "NVDA", "META", "BRK-B", "TSLA", "AVGO",
+    "WMT", "LLY", "JPM", "V", "UNH", "XOM", "MA", "ORCL", "COST", "HD",
+    "PG", "JNJ", "NFLX", "ABBV", "BAC", "CRM", "TMUS", "CVX", "AMD", "KO",
+    "PEP", "TMO", "LIN", "WFC", "ADBE", "MRK", "DIS", "ACN", "CSCO", "ABT",
+    "MCD", "INTU", "VZ", "QCOM", "GE", "TXN", "DHR", "IBM", "CAT", "AXP",
+
+    # ═══ تقنية — لارج كاب (100) ═══
+    "AMGN", "NOW", "PM", "NEE", "PFE", "RTX", "SPGI", "UNP", "UBER", "GS",
+    "HON", "ISRG", "T", "LOW", "ELV", "SYK", "BKNG", "BLK", "ETN", "VRTX",
+    "C", "TJX", "MDT", "REGN", "BA", "PLD", "MMC", "CB", "SCHW", "ADP",
+    "BSX", "CI", "DE", "ADI", "LMT", "MDLZ", "FI", "BMY", "SO", "CVS",
+    "AMAT", "SBUX", "GILD", "MU", "PANW", "KLAC", "LRCX", "INTC", "PGR", "ELV",
+    "PLTR", "SHOP", "SNOW", "DDOG", "CRWD", "ZS", "NET", "MDB", "TEAM", "WDAY",
+    "ADSK", "CDNS", "SNPS", "ANSS", "FTNT", "OKTA", "DOCU", "TWLO", "HUBS", "ZM",
+    "SQ", "PYPL", "COIN", "HOOD", "SOFI", "AFRM", "MRVL", "NXPI", "MCHP", "ON",
+    "WDC", "STX", "DELL", "HPQ", "HPE", "NTAP", "SMCI", "ARM", "TER", "ROP",
+    "TYL", "PTC", "VRSN", "CTSH", "INFY", "WIT", "EPAM", "GLOB", "FIS", "FISV",
+    "SSNC", "JKHY", "FFIV", "AKAM", "JNPR", "MSI", "APH", "TEL", "GLW", "KEYS",
+
+    # ═══ رعاية صحية — لارج كاب (60) ═══
+    "HUM", "HCA", "MCK", "ABC", "CAH", "DGX", "LH", "BAX", "BDX", "BIIB",
+    "ILMN", "IDXX", "A", "MTD", "WAT", "RMD", "HOLX", "COO", "EW", "DXCM",
+    "PODD", "ALGN", "ZBH", "ABMD", "TFX", "COO", "STE", "XRAY", "ALC", "CRL",
+    "IQV", "LH", "MTD", "PKI", "RVTY", "WAT", "BIO", "TECH", "CRL", "QGEN",
+    "MOH", "CNC", "WCG", "ALHC", "OSCR", "CLOV", "HIMS", "DOCS", "VEEV", "TDOC",
+    "AMWL", "ONEM", "PHR", "HCTI", "CERT", "EVH", "PGNY", "ACCD", "GDRX", "HNGR",
+
+    # ═══ مالية — لارج كاب (60) ═══
+    "USB", "PNC", "TFC", "MTB", "FITB", "HBAN", "RF", "KEY", "CFG", "STT",
+    "BK", "NTRS", "MS", "PRU", "MET", "AFL", "ALL", "TRV", "AIG", "AJG",
+    "AON", "MCO", "ICE", "CME", "NDAQ", "CBOE", "MSCI", "MKTX", "TW", "CINF",
+    "WRB", "L", "RE", "GL", "CNA", "HIG", "AIG", "ACGL", "EG", "AIZ",
+    "SYF", "DFS", "ALLY", "COF", "AXP", "JPM", "BAC", "WFC", "C", "GS",
+    "MS", "BLK", "SCHW", "BX", "KKR", "APO", "ARES", "OWL", "TPG", "CG",
+
+    # ═══ استهلاكي — لارج كاب (80) ═══
+    "HD", "LOW", "TGT", "KR", "SYY", "ADM", "GIS", "K", "HSY", "MDLZ",
+    "MKC", "CL", "KMB", "CHD", "EL", "PG", "SBUX", "MCD", "YUM", "CMG",
+    "DPZ", "WEN", "QSR", "DKNG", "MAR", "HLT", "H", "RCL", "CCL", "NCLH",
+    "LUV", "DAL", "AAL", "UAL", "F", "GM", "RIVN", "LCID", "NIO", "XPEV",
+    "LI", "TM", "HMC", "STLA", "RACE", "APTV", "BWA", "LEA", "MGA", "ALV",
+    "TSCO", "ORLY", "AZO", "AAP", "GPC", "LKQ", "ULTA", "BBY", "DKS", "ROST",
+    "TJX", "BURL", "M", "JWN", "KSS", "GPS", "ANF", "AEO", "URBN", "PLCE",
+    "COST", "WMT", "BJ", "PSMT", "DLTR", "DG", "FIVE", "OLLI", "BIG", "WBA",
+
+    # ═══ صناعة — لارج كاب (70) ═══
+    "CAT", "DE", "CMI", "PCAR", "GE", "MMM", "HON", "EMR", "ETN", "PH",
+    "ROK", "DOV", "IR", "ITW", "CSX", "UNP", "NSC", "UPS", "FDX", "LMT",
+    "RTX", "GD", "NOC", "BA", "LHX", "HII", "TDG", "HEI", "TXT", "AXON",
+    "WM", "RSG", "CWST", "SRCL", "CLH", "ECOL", "USX", "SAIA", "ODFL", "XPO",
+    "CHRW", "EXPD", "HUBG", "LSTR", "JBHT", "KNX", "WERN", "SNDR", "ARCB", "MRTN",
+    "GWW", "FAST", "POOL", "WSO", "BECN", "BLDR", "UFPI", "BCC", "LPX", "MAS",
+    "GEV", "VRT", "GNRC", "PWR", "ETN", "AME", "ROP", "DHR", "ITW", "PH",
+
+    # ═══ طاقة — لارج كاب (30) ═══
+    "XOM", "CVX", "COP", "EOG", "PXD", "DVN", "OXY", "HAL", "SLB", "BKR",
+    "PSX", "VLO", "MPC", "KMI", "WMB", "OKE", "ET", "EPD", "PAA", "TRGP",
+    "HES", "MRO", "APA", "CTRA", "FANG", "HESM", "DINO", "PBF", "DK", "PARR",
+
+    # ═══ مرافق/اتصالات — لارج كاب (50) ═══
+    "T", "VZ", "TMUS", "CMCSA", "CHTR", "DIS", "WBD", "PARA", "NFLX", "FOXA",
+    "NEE", "DUK", "SO", "D", "AEP", "EXC", "XEL", "SRE", "PEG", "ED",
+    "WEC", "ES", "AEE", "DTE", "PPL", "FE", "ETR", "CMS", "CNP", "NI",
+    "AES", "NRG", "VST", "CEG", "PEG", "PSEG", "PNW", "LNT", "EVRG", "OGE",
+    "SRE", "PCG", "EIX", "AWK", "WTRG", "SJW", "CWT", "MSEX", "YORW", "ARTNA",
 ]
+
 
 # ============================================================
 # حالة المسح + المراقبة
@@ -91,7 +149,7 @@ def get_ctx():
 
 
 def norm(symbol: str) -> str:
-    s = symbol.strip().upper()
+    s = symbol.strip().upper().replace("-", ".")
     return s if "." in s else f"{s}.US"
 
 
@@ -124,9 +182,6 @@ PERIOD_MAP = {
 }
 
 
-# ============================================================
-# ✅ fetch_candles — مع Cache
-# ============================================================
 def fetch_candles(symbol, timeframe, count=200):
     tf = timeframe.lower()
     key = f"{symbol.upper()}:{tf}:{count}"
@@ -147,9 +202,7 @@ def fetch_candles(symbol, timeframe, count=200):
                                 AdjustType.NoAdjust,
                                 trade_sessions=TradeSessions.All)
 
-    # حد أقصى لحجم الـ cache
     if len(_candle_cache) > _CANDLE_CACHE_MAX:
-        # احذف الأقدم
         oldest = sorted(_candle_cache.items(), key=lambda x: x[1][0])[:500]
         for k, _ in oldest:
             _candle_cache.pop(k, None)
@@ -203,6 +256,7 @@ def _empty_option_result():
         "total_call_oi": 0, "total_put_oi": 0,
         "total_call_vol": 0, "total_put_vol": 0,
         "whales": [],
+        "filter_pass": False, "filter_reason": "",
     }
 
 
@@ -212,7 +266,10 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
     result = _empty_option_result()
     try:
         raw_dates = ctx.option_chain_expiry_date_list(sym)
-        if not raw_dates: return result
+        if not raw_dates:
+            result["filter_reason"] = "no_dates"
+            return result
+
         today = datetime.now(timezone.utc).date()
         target_dte = 10
         parsed = []
@@ -229,6 +286,7 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
         if not valid:
             valid = [(d, (d - today).days) for d in parsed]
         if not valid:
+            result["filter_reason"] = "no_valid_expiry"
             return result
 
         exp_date, dte = min(valid, key=lambda x: abs(x[1] - target_dte))
@@ -236,9 +294,11 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
         result["dte"] = dte
 
         chain = ctx.option_chain_info_by_date(sym, exp_date)
-        if not chain: return result
+        if not chain:
+            result["filter_reason"] = "no_chain"
+            return result
 
-        base_match = re.match(r'^([A-Z]+)', sym.replace(".US", ""))
+        base_match = re.match(r'^([A-Z.]+)', sym.replace(".US", ""))
         base_sym = base_match.group(1) if base_match else sym.replace(".US", "")
         yy = exp_date.strftime("%y"); mm = exp_date.strftime("%m"); dd = exp_date.strftime("%d")
         prefix = f"{base_sym}{yy}{mm}{dd}"
@@ -252,28 +312,57 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
         if direction == "bullish":
             target = price * 1.005
             cands = [c for c in chain if _call_of(c) and _strike_of(c) > price]
-            if not cands: return result
+            if not cands:
+                result["filter_reason"] = "no_call_strike"
+                return result
             best = min(cands, key=lambda c: abs(_strike_of(c) - target))
             option_symbol = _call_of(best); strike = _strike_of(best); opt_type = "C"
         else:
             target = price * 0.995
             cands = [c for c in chain if _put_of(c) and _strike_of(c) < price]
-            if not cands: return result
+            if not cands:
+                result["filter_reason"] = "no_put_strike"
+                return result
             best = min(cands, key=lambda c: abs(_strike_of(c) - target))
             option_symbol = _put_of(best); strike = _strike_of(best); opt_type = "P"
 
         result["strike"] = f"{opt_type} {int(strike)}"
+
+        # ✅ فلترة العقد الرئيسي
         try:
             oqs = ctx.option_quote([option_symbol])
             if oqs:
                 oq = oqs[0]
+                last = None
                 for attr in ("last_done", "last", "price"):
                     v = getattr(oq, attr, None)
                     if v is not None:
-                        result["premium"] = round(float(v), 2); break
+                        last = float(v)
+                        result["premium"] = round(last, 2)
+                        break
+
+                bid = float(getattr(oq, "bid", 0) or 0)
+                ask = float(getattr(oq, "ask", 0) or 0)
+                spread = (ask - bid) if ask > bid > 0 else 999
+
+                # فحص الفلاتر
+                if last is None:
+                    result["filter_reason"] = "no_premium"
+                    return result
+                if last > MAX_PREMIUM:
+                    result["filter_reason"] = f"premium_too_high ({last})"
+                    return result
+                if spread > MAX_SPREAD:
+                    result["filter_reason"] = f"spread_too_wide ({spread:.2f})"
+                    return result
+
+                result["filter_pass"] = True
+
                 if hasattr(oq, "delta"):
                     result["delta"] = round(float(oq.delta), 3)
-        except Exception: pass
+        except Exception as e:
+            result["filter_reason"] = f"quote_error: {e}"
+            return result
 
         all_call_syms, all_put_syms = [], []
         strikes_map = {}
@@ -346,28 +435,28 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
                 if vol < WHALE_MIN_VOLUME and oi < WHALE_MIN_OI: continue
                 bid = float(getattr(q, "bid", 0) or 0)
                 ask = float(getattr(q, "ask", 0) or 0)
-                last = float(getattr(q, "last_done", 0) or getattr(q, "last", 0) or 0)
+                last_w = float(getattr(q, "last_done", 0) or getattr(q, "last", 0) or 0)
                 dw = "mid"
                 if ask > bid > 0:
                     sp = ask - bid
-                    pos = (last - bid) / sp if sp > 0 else 0.5
+                    pos = (last_w - bid) / sp if sp > 0 else 0.5
                     if pos >= 0.7: dw = "buy"
                     elif pos <= 0.3: dw = "sell"
                 whales.append({"strike": sk, "type": tp_, "volume": vol, "oi": oi,
                                "bid": round(bid,2), "ask": round(ask,2),
-                               "last": round(last,2), "direction": dw})
+                               "last": round(last_w,2), "direction": dw})
         whales.sort(key=lambda w: w["volume"], reverse=True)
         result["whales"] = whales[:5]
     except Exception as e:
-        print(f"[OPT] {e}", flush=True)
+        print(f"[OPT] {symbol} {e}", flush=True)
+        result["filter_reason"] = f"exception: {e}"
     return result
 
 
 # ============================================================
-# ✅ analyze_symbol — الخيارات مؤجلة بعد الفحص الفني
+# analyze_symbol
 # ============================================================
 def analyze_symbol(symbol: str) -> dict:
-    # ✅ 1) الشموع (مع cache) — العدد الجديد
     df_weekly = candles_to_df(fetch_candles(symbol, "1w", 150))
     df_daily  = candles_to_df(fetch_candles(symbol, "1d", 400))
     df_4h     = candles_to_df(fetch_candles(symbol, "4h", 200))
@@ -387,12 +476,10 @@ def analyze_symbol(symbol: str) -> dict:
     df_4h     = enrich(df_4h)
     df_1h     = enrich(df_1h)
 
-    # ✅ 2) السعر الحالي
     q = get_ctx().quote([norm(symbol)])[0]
     price = float(q.last_done)
     prev_close = float(q.prev_close)
 
-    # ✅ 3) الفحص الفني
     scan = scan_setup(df_weekly, df_daily, df_4h, df_1h)
 
     card = {
@@ -412,9 +499,15 @@ def analyze_symbol(symbol: str) -> dict:
     direction = scan["direction"] or "bullish"
     levels = scan["levels"]
 
-    # ✅ 4) جلب الخيارات فقط إذا كانت الإشارة مؤكدة
+    # ✅ الخيارات فقط عند green/red + فلتر العقد
+    filter_rejected = False
+    filter_reason = ""
     if scan["color"] in ("green", "red"):
         opt = fetch_option_data(symbol, direction, price, "swing")
+        if not opt.get("filter_pass", False):
+            filter_rejected = True
+            filter_reason = opt.get("filter_reason", "unknown")
+            opt = _empty_option_result()
     else:
         opt = _empty_option_result()
 
@@ -471,6 +564,8 @@ def analyze_symbol(symbol: str) -> dict:
         "total_call_vol": opt.get("total_call_vol", 0),
         "total_put_vol":  opt.get("total_put_vol", 0),
         "whales": opt.get("whales", []),
+        "filter_rejected": filter_rejected,
+        "filter_reason": filter_reason,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -488,63 +583,73 @@ def analyze_cached(symbol):
 
 
 # ============================================================
-# منطق المسح
+# ✅ المسح مع المعالجة المتوازية
 # ============================================================
+async def analyze_one_safe(sym, semaphore):
+    async with semaphore:
+        try:
+            data = await asyncio.to_thread(analyze_symbol, sym)
+            return sym, data, None
+        except Exception as e:
+            return sym, None, str(e)
+
+
 async def run_scan(scan_id: str):
     scan = _scans.get(scan_id)
     if not scan:
         return
 
     scan["status"] = "running"
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-    for i, sym in enumerate(SCAN_SYMBOLS):
+    # تقسيم القائمة لدفعات من 5
+    for i in range(0, len(SCAN_SYMBOLS), MAX_CONCURRENT):
         if scan.get("cancelled"):
             scan["status"] = "cancelled"
             return
 
-        try:
-            if sym in scan["results_map"]:
-                continue
+        batch = SCAN_SYMBOLS[i:i + MAX_CONCURRENT]
 
-            data = await asyncio.to_thread(analyze_symbol, sym)
-            scan["results_map"][sym] = data
+        # ✅ معالجة 5 معاً
+        results = await asyncio.gather(
+            *[analyze_one_safe(sym, semaphore) for sym in batch]
+        )
 
-            card = data.get("card", {})
-            color = card.get("color", "gray")
+        for sym, data, error in results:
+            if error:
+                print(f"[SCAN] {sym} error: {error}", flush=True)
+                scan["errors"].append({"symbol": sym, "error": error})
+            elif data:
+                scan["results_map"][sym] = data
+                card = data.get("card", {})
+                color = card.get("color", "gray")
 
-            if color in ("green", "red"):
-                scan["results"].append(data)
+                if color in ("green", "red") and not data.get("filter_rejected", False):
+                    scan["results"].append(data)
 
-                levels = data.get("levels", {})
-                entry = levels.get("entry")
-                target = levels.get("target1")
-                stop = levels.get("stop")
+                    levels = data.get("levels", {})
+                    entry = levels.get("entry")
+                    target = levels.get("target1")
+                    stop = levels.get("stop")
 
-                if entry and target and stop:
-                    _monitoring[sym] = {
-                        "symbol": sym,
-                        "direction": "call" if color == "green" else "put",
-                        "entry": float(entry),
-                        "target": float(target),
-                        "stop": float(stop),
-                        "color": color,
-                        "score": card.get("score", 0),
-                        "created_at": time.time(),
-                        "expires_at": time.time() + MONITOR_DAYS * 86400,
-                        "status": "active",
-                        "alerts_sent": set(),
-                        "last_price": float(data.get("price", entry)),
-                    }
-                    print(f"[MONITOR] added {sym} ({color})", flush=True)
+                    if entry and target and stop:
+                        _monitoring[sym] = {
+                            "symbol": sym,
+                            "direction": "call" if color == "green" else "put",
+                            "entry": float(entry),
+                            "target": float(target),
+                            "stop": float(stop),
+                            "color": color,
+                            "score": card.get("score", 0),
+                            "created_at": time.time(),
+                            "expires_at": time.time() + MONITOR_DAYS * 86400,
+                            "status": "active",
+                            "alerts_sent": set(),
+                            "last_price": float(data.get("price", entry)),
+                        }
+                        print(f"[MONITOR] added {sym} ({color})", flush=True)
 
-            scan["completed"] = i + 1
-
-        except Exception as e:
-            print(f"[SCAN] {sym} error: {e}", flush=True)
-            scan["errors"].append({"symbol": sym, "error": str(e)})
-            scan["completed"] = i + 1
-
-        await asyncio.sleep(0.05)  # تأخير مخفف — الـ cache يقوم بالعمل
+            scan["completed"] += 1
 
     scan["status"] = "done"
     scan["finished_at"] = time.time()
@@ -566,7 +671,6 @@ def cleanup_old_scans():
 # ============================================================
 async def monitor_task():
     await asyncio.sleep(60)
-
     while True:
         try:
             if not _monitoring:
@@ -574,11 +678,9 @@ async def monitor_task():
                 continue
 
             now = time.time()
-
             for sym in list(_monitoring.keys()):
                 m = _monitoring.get(sym)
-                if not m:
-                    continue
+                if not m: continue
 
                 if m["status"] != "active":
                     if m["status"] in ("target_hit", "stop_hit", "expired"):
@@ -591,70 +693,44 @@ async def monitor_task():
                     m["ended_at"] = now
                     await asyncio.to_thread(
                         send_telegram_alert,
-                        f"⏰ <b>انتهت المدة</b> — {sym}\nمرت {MONITOR_DAYS} أيام بدون هدف أو وقف."
+                        f"⏰ <b>انتهت المدة</b> — {sym}\nمرت {MONITOR_DAYS} أيام."
                     )
                     continue
 
                 price = await asyncio.to_thread(get_current_price, sym)
-                if price is None:
-                    continue
-
+                if price is None: continue
                 m["last_price"] = price
                 direction = m["direction"]
                 target = m["target"]
                 stop = m["stop"]
 
                 if "target" not in m["alerts_sent"]:
-                    if direction == "call" and price >= target:
+                    hit = (direction == "call" and price >= target) or \
+                          (direction == "put" and price <= target)
+                    if hit:
                         m["status"] = "target_hit"
                         m["ended_at"] = now
                         m["alerts_sent"].add("target")
                         await asyncio.to_thread(
                             send_telegram_alert,
-                            f"✅ <b>تحقق الهدف</b> — {sym}\n"
-                            f"السعر: ${price:.2f}\n"
-                            f"الهدف: ${target:.2f}"
-                        )
-                        continue
-                    if direction == "put" and price <= target:
-                        m["status"] = "target_hit"
-                        m["ended_at"] = now
-                        m["alerts_sent"].add("target")
-                        await asyncio.to_thread(
-                            send_telegram_alert,
-                            f"✅ <b>تحقق الهدف</b> — {sym}\n"
-                            f"السعر: ${price:.2f}\n"
-                            f"الهدف: ${target:.2f}"
+                            f"✅ <b>تحقق الهدف</b> — {sym}\nالسعر: ${price:.2f}\nالهدف: ${target:.2f}"
                         )
                         continue
 
                 if "stop" not in m["alerts_sent"]:
-                    if direction == "call" and price <= stop:
+                    hit = (direction == "call" and price <= stop) or \
+                          (direction == "put" and price >= stop)
+                    if hit:
                         m["status"] = "stop_hit"
                         m["ended_at"] = now
                         m["alerts_sent"].add("stop")
                         await asyncio.to_thread(
                             send_telegram_alert,
-                            f"❌ <b>ضرب الوقف</b> — {sym}\n"
-                            f"السعر: ${price:.2f}\n"
-                            f"الوقف: ${stop:.2f}"
+                            f"❌ <b>ضرب الوقف</b> — {sym}\nالسعر: ${price:.2f}\nالوقف: ${stop:.2f}"
                         )
                         continue
-                    if direction == "put" and price >= stop:
-                        m["status"] = "stop_hit"
-                        m["ended_at"] = now
-                        m["alerts_sent"].add("stop")
-                        await asyncio.to_thread(
-                            send_telegram_alert,
-                            f"❌ <b>ضرب الوقف</b> — {sym}\n"
-                            f"السعر: ${price:.2f}\n"
-                            f"الوقف: ${stop:.2f}"
-                        )
-                        continue
-
         except Exception as e:
             print(f"[MONITOR] error: {e}", flush=True)
-
         await asyncio.sleep(MONITOR_INTERVAL)
 
 
@@ -665,7 +741,6 @@ async def monitor_task():
 async def lifespan(app: FastAPI):
     global _event_loop
     _event_loop = asyncio.get_running_loop()
-
     try:
         ctx = get_ctx()
         ctx.set_on_quote(_on_quote)
@@ -675,7 +750,7 @@ async def lifespan(app: FastAPI):
 
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         try:
-            send_telegram_alert("🚀 <b>Longbridge Scanner</b> — النظام يعمل")
+            send_telegram_alert("🚀 <b>Longbridge Scanner</b> — النظام يعمل (500 سهم)")
         except Exception: pass
 
     async def keepalive():
@@ -684,16 +759,12 @@ async def lifespan(app: FastAPI):
             try:
                 get_ctx().quote(["AAPL.US"])
                 cleanup_old_scans()
-            except Exception:
-                pass
+            except Exception: pass
 
     ka = asyncio.create_task(keepalive())
     mt = asyncio.create_task(monitor_task())
-
     yield
-
-    ka.cancel()
-    mt.cancel()
+    ka.cancel(); mt.cancel()
     global _quote_ctx
     _quote_ctx = None
 
@@ -733,21 +804,14 @@ def get_symbols():
 @app.post("/api/scan/start")
 async def scan_start():
     cleanup_old_scans()
-
     scan_id = str(uuid.uuid4())
     _scans[scan_id] = {
-        "id": scan_id,
-        "status": "starting",
-        "total": len(SCAN_SYMBOLS),
-        "completed": 0,
-        "results": [],
-        "results_map": {},
-        "errors": [],
-        "started_at": time.time(),
+        "id": scan_id, "status": "starting",
+        "total": len(SCAN_SYMBOLS), "completed": 0,
+        "results": [], "results_map": {},
+        "errors": [], "started_at": time.time(),
     }
-
     asyncio.create_task(run_scan(scan_id))
-
     return {"scan_id": scan_id, "total": len(SCAN_SYMBOLS)}
 
 
@@ -756,7 +820,6 @@ def scan_status(scan_id: str):
     scan = _scans.get(scan_id)
     if not scan:
         return JSONResponse(status_code=404, content={"error": "scan not found"})
-
     results = []
     for r in scan["results"]:
         sym = r.get("symbol")
@@ -766,14 +829,10 @@ def scan_status(scan_id: str):
         r_copy["monitor_price"] = m.get("last_price")
         r_copy["monitor_expires_at"] = m.get("expires_at")
         results.append(r_copy)
-
     return {
-        "scan_id": scan_id,
-        "status": scan["status"],
-        "total": scan["total"],
-        "completed": scan["completed"],
-        "found": len(scan["results"]),
-        "results": results,
+        "scan_id": scan_id, "status": scan["status"],
+        "total": scan["total"], "completed": scan["completed"],
+        "found": len(scan["results"]), "results": results,
         "errors_count": len(scan["errors"]),
     }
 
@@ -802,15 +861,10 @@ def monitor_status(symbol: str):
     if not m:
         return {"monitored": False}
     return {
-        "monitored": True,
-        "symbol": sym,
-        "status": m["status"],
-        "entry": m["entry"],
-        "target": m["target"],
-        "stop": m["stop"],
+        "monitored": True, "symbol": sym, "status": m["status"],
+        "entry": m["entry"], "target": m["target"], "stop": m["stop"],
         "last_price": m.get("last_price"),
-        "expires_at": m["expires_at"],
-        "direction": m["direction"],
+        "expires_at": m["expires_at"], "direction": m["direction"],
     }
 
 
@@ -819,7 +873,6 @@ def monitor_remove(symbol: str):
     sym = symbol.upper().strip()
     if sym in _monitoring:
         _monitoring.pop(sym, None)
-        print(f"[MONITOR] removed {sym}", flush=True)
     return {"ok": True}
 
 
@@ -828,19 +881,6 @@ def get_monitoring():
     return {
         "count": len(_monitoring),
         "symbols": list(_monitoring.keys()),
-        "details": [
-            {
-                "symbol": s,
-                "status": m["status"],
-                "entry": m["entry"],
-                "target": m["target"],
-                "stop": m["stop"],
-                "last_price": m.get("last_price"),
-                "direction": m["direction"],
-                "score": m["score"],
-            }
-            for s, m in _monitoring.items()
-        ],
     }
 
 
@@ -850,6 +890,10 @@ def cache_stats():
         "candle_cache_size": len(_candle_cache),
         "analyze_cache_size": len(_analyze_cache),
         "monitoring_count": len(_monitoring),
+        "symbols_total": len(SCAN_SYMBOLS),
+        "max_premium": MAX_PREMIUM,
+        "max_spread": MAX_SPREAD,
+        "max_concurrent": MAX_CONCURRENT,
     }
 
 
