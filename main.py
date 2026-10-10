@@ -1,5 +1,6 @@
 """
 main.py — Longbridge Options Radar Scanner
+النسخة النهائية — 4 فريمات، مساران، حذف الرمادي نهائياً
 """
 import os
 import time
@@ -21,8 +22,7 @@ from longbridge.openapi import (
 )
 
 from analysis import (
-    ema, rsi, atr, adx, vwap,
-    check_breakout, check_retest,
+    atr, check_breakout, find_retest,
     scan_setup,
 )
 
@@ -35,17 +35,22 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 _quote_ctx: QuoteContext | None = None
 _event_loop: asyncio.AbstractEventLoop | None = None
 _subscribed: set[str] = set()
-_sent_alerts: set[str] = set()
 _analyze_cache: dict[str, tuple[float, dict]] = {}
 _ANALYZE_TTL = 25
 
 # ✅ فلاتر العقد
 MAX_PREMIUM = 2.5
 MAX_SPREAD  = 0.10
+DTE_MIN     = 5
+DTE_MAX     = 20
+DTE_TARGET  = 10
+OTM_MIN_PCT = 0.005
+OTM_MAX_PCT = 0.04
+OTM_TARGET  = 0.02
 
 # ✅ Cache
 _candle_cache: dict[str, tuple[float, list]] = {}
-_CANDLE_TTL = {"15m": 180, "1h": 300, "4h": 900, "1d": 3600, "1w": 3600}
+_CANDLE_TTL = {"1h": 300, "4h": 900, "1d": 3600, "1w": 3600}
 _CANDLE_CACHE_MAX = 5000
 
 WHALE_MIN_VOLUME = 3000
@@ -54,7 +59,11 @@ MONITOR_DAYS = 10
 MONITOR_INTERVAL = 60
 MAX_CONCURRENT = 5
 
-# ✅ FIX #11 + #12: حذف الرموز المحذوفة + منع التكرار مع الحفاظ على الترتيب
+NEARBY_STRIKES = 5
+OPTION_QUOTE_BATCH = 50
+
+VALID_COLORS = ("green", "red")
+
 SCAN_SYMBOLS = list(dict.fromkeys([
     "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "NVDA", "META", "BRK-B", "TSLA", "AVGO",
     "WMT", "LLY", "JPM", "V", "UNH", "XOM", "MA", "ORCL", "COST", "HD",
@@ -148,8 +157,10 @@ def candles_to_df(candles):
 
 
 PERIOD_MAP = {
-    "15m": Period.Min_15, "1h": Period.Min_60,
-    "4h": Period.Min_240, "1d": Period.Day, "1w": Period.Week,
+    "1h": Period.Min_60,
+    "4h": Period.Min_240,
+    "1d": Period.Day,
+    "1w": Period.Week,
 }
 
 
@@ -231,6 +242,20 @@ def _empty_option_result():
     }
 
 
+def _pick_strike(candidates, price, target_pct, is_call):
+    """يختار أقرب strike للهدف ضمن النطاق [0.5%, 4%] OTM."""
+    if not candidates:
+        return None
+    target_price = price * (1 + target_pct) if is_call else price * (1 - target_pct)
+    lo = price * (1 + OTM_MIN_PCT) if is_call else price * (1 - OTM_MAX_PCT)
+    hi = price * (1 + OTM_MAX_PCT) if is_call else price * (1 - OTM_MIN_PCT)
+
+    in_range = [c for c in candidates
+                if lo <= _strike_of(c) <= hi]
+    pool = in_range if in_range else candidates
+    return min(pool, key=lambda c: abs(_strike_of(c) - target_price))
+
+
 def fetch_option_data(symbol, direction, price, strategy="swing"):
     ctx = get_ctx()
     sym = norm(symbol)
@@ -242,7 +267,6 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
             return result
 
         today = datetime.now(timezone.utc).date()
-        target_dte = 10
         parsed = []
         for d in raw_dates:
             if isinstance(d, date_cls):
@@ -253,14 +277,15 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
                     if dd > today: parsed.append(dd)
                 except Exception: continue
 
-        valid = [(d, (d - today).days) for d in parsed if 5 <= (d - today).days <= 20]
+        valid = [(d, (d - today).days) for d in parsed
+                 if DTE_MIN <= (d - today).days <= DTE_MAX]
         if not valid:
             valid = [(d, (d - today).days) for d in parsed]
         if not valid:
             result["filter_reason"] = "no_valid_expiry"
             return result
 
-        exp_date, dte = min(valid, key=lambda x: abs(x[1] - target_dte))
+        exp_date, dte = min(valid, key=lambda x: abs(x[1] - DTE_TARGET))
         result["expiry"] = exp_date.strftime("%b %d").upper()
         result["dte"] = dte
 
@@ -280,26 +305,36 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
         def build_put_sym(sk):
             return f"{prefix}P{str(int(round(sk * 1000))).zfill(8)}.US"
 
-        if direction == "bullish":
-            target = price * 1.02   # ✅ OTM 2% (أرخص)
+        is_call = (direction == "bullish")
+
+        if is_call:
             cands = [c for c in chain if _call_of(c) and _strike_of(c) > price]
             if not cands:
                 result["filter_reason"] = "no_call_strike"
                 return result
-            best = min(cands, key=lambda c: abs(_strike_of(c) - target))
-            option_symbol = _call_of(best); strike = _strike_of(best); opt_type = "C"
+            best = _pick_strike(cands, price, OTM_TARGET, True)
+            if best is None:
+                result["filter_reason"] = "no_call_strike"
+                return result
+            option_symbol = _call_of(best)
+            strike = _strike_of(best)
+            opt_type = "C"
         else:
-            target = price * 0.98   # ✅ OTM 2%
             cands = [c for c in chain if _put_of(c) and _strike_of(c) < price]
             if not cands:
                 result["filter_reason"] = "no_put_strike"
                 return result
-            best = min(cands, key=lambda c: abs(_strike_of(c) - target))
-            option_symbol = _put_of(best); strike = _strike_of(best); opt_type = "P"
+            best = _pick_strike(cands, price, OTM_TARGET, False)
+            if best is None:
+                result["filter_reason"] = "no_put_strike"
+                return result
+            option_symbol = _put_of(best)
+            strike = _strike_of(best)
+            opt_type = "P"
 
         result["strike"] = f"{opt_type} {int(strike)}"
 
-        # ✅ فلتر العقد — لا نعود، نكمل
+        # فلتر العقد
         try:
             oqs = ctx.option_quote([option_symbol])
             if oqs:
@@ -318,13 +353,10 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
 
                 if last is None:
                     result["filter_reason"] = "no_premium"
-                    result["filter_pass"] = False
                 elif last > MAX_PREMIUM:
                     result["filter_reason"] = f"premium_too_high ({last})"
-                    result["filter_pass"] = False
                 elif spread > MAX_SPREAD:
                     result["filter_reason"] = f"spread_too_wide ({spread:.2f})"
-                    result["filter_pass"] = False
                 else:
                     result["filter_pass"] = True
 
@@ -332,26 +364,33 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
                     result["delta"] = round(float(oq.delta), 3)
         except Exception as e:
             result["filter_reason"] = f"quote_error: {e}"
-            # لا نعود — نكمل
 
-        # ✅ نكمل جلب OI/Volume/Whales دائماً
-        all_call_syms, all_put_syms = [], []
+        # 5 CALL فوق السعر + 5 PUT تحت السعر
+        calls_above = sorted(
+            [c for c in chain if _strike_of(c) > price and _call_of(c)],
+            key=lambda c: _strike_of(c)
+        )[:NEARBY_STRIKES]
+        puts_below = sorted(
+            [c for c in chain if _strike_of(c) < price and _put_of(c)],
+            key=lambda c: -_strike_of(c)
+        )[:NEARBY_STRIKES]
+
         strikes_map = {}
-
-        for c in chain:
+        for c in calls_above:
             sk = _strike_of(c)
-            if sk <= 0: continue
-            cs = _call_of(c) or build_call_sym(sk)
-            ps = _put_of(c)  or build_put_sym(sk)
-            all_call_syms.append(cs)
-            all_put_syms.append(ps)
-            strikes_map[sk] = (cs, ps)
+            strikes_map.setdefault(sk, [None, None])[0] = _call_of(c) or build_call_sym(sk)
+        for c in puts_below:
+            sk = _strike_of(c)
+            strikes_map.setdefault(sk, [None, None])[1] = _put_of(c) or build_put_sym(sk)
+
+        all_call_syms = [v[0] for v in strikes_map.values() if v[0]]
+        all_put_syms  = [v[1] for v in strikes_map.values() if v[1]]
 
         qmap = {}
         all_syms = list(set(all_call_syms + all_put_syms))
-        for i in range(0, len(all_syms), 30):
+        for i in range(0, len(all_syms), OPTION_QUOTE_BATCH):
             try:
-                qs = ctx.option_quote(all_syms[i:i+30])
+                qs = ctx.option_quote(all_syms[i:i+OPTION_QUOTE_BATCH])
                 if qs:
                     for q in qs: qmap[q.symbol] = q
             except Exception: pass
@@ -373,31 +412,25 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
         result["total_call_vol"] = tc_v
         result["total_put_vol"]  = tp_v
 
-        nearby = sorted(chain, key=lambda c: abs(_strike_of(c) - price))[:5]
-        cd, pd_ = [], []
-        for c in nearby:
-            sk = int(_strike_of(c))
-            cs, ps = strikes_map.get(_strike_of(c), (None, None))
+        cd = []
+        for sk, (cs, _) in sorted(strikes_map.items(), reverse=True):
             if cs and cs in qmap:
                 q = qmap[cs]
-                cd.append({"strike": sk,
-                           "oi": int(getattr(q,"open_interest",0) or 0),
-                           "volume": int(getattr(q,"volume",0) or 0)})
+                cd.append({"strike": int(sk),
+                           "oi": int(getattr(q, "open_interest", 0) or 0),
+                           "volume": int(getattr(q, "volume", 0) or 0)})
+        pd_ = []
+        for sk, (_, ps) in sorted(strikes_map.items(), reverse=True):
             if ps and ps in qmap:
                 q = qmap[ps]
-                pd_.append({"strike": sk,
-                            "oi": int(getattr(q,"open_interest",0) or 0),
-                            "volume": int(getattr(q,"volume",0) or 0)})
-        cd.sort(key=lambda x: x["strike"], reverse=True)
-        pd_.sort(key=lambda x: x["strike"], reverse=True)
+                pd_.append({"strike": int(sk),
+                            "oi": int(getattr(q, "open_interest", 0) or 0),
+                            "volume": int(getattr(q, "volume", 0) or 0)})
         result["call_oi"] = cd
         result["put_oi"]  = pd_
 
         whales = []
-        wide = sorted(chain, key=lambda c: abs(_strike_of(c) - price))[:10]
-        for c in wide:
-            sk = int(_strike_of(c))
-            cs, ps = strikes_map.get(_strike_of(c), (None, None))
+        for sk, (cs, ps) in strikes_map.items():
             for sym_opt, tp_ in ((cs, "CALL"), (ps, "PUT")):
                 if not sym_opt or sym_opt not in qmap: continue
                 q = qmap[sym_opt]
@@ -413,9 +446,9 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
                     pos = (last_w - bid) / sp if sp > 0 else 0.5
                     if pos >= 0.7: dw = "buy"
                     elif pos <= 0.3: dw = "sell"
-                whales.append({"strike": sk, "type": tp_, "volume": vol, "oi": oi,
-                               "bid": round(bid,2), "ask": round(ask,2),
-                               "last": round(last_w,2), "direction": dw})
+                whales.append({"strike": int(sk), "type": tp_, "volume": vol, "oi": oi,
+                               "bid": round(bid, 2), "ask": round(ask, 2),
+                               "last": round(last_w, 2), "direction": dw})
         whales.sort(key=lambda w: w["volume"], reverse=True)
         result["whales"] = whales[:5]
     except Exception as e:
@@ -432,13 +465,21 @@ def analyze_symbol(symbol: str) -> dict:
     df_daily  = candles_to_df(fetch_candles(symbol, "1d", 400))
     df_4h     = candles_to_df(fetch_candles(symbol, "4h", 200))
     df_1h     = candles_to_df(fetch_candles(symbol, "1h", 200))
-    df_15m    = candles_to_df(fetch_candles(symbol, "15m", 200))
 
     q = get_ctx().quote([norm(symbol)])[0]
     price = float(q.last_done)
     prev_close = float(q.prev_close)
 
-    scan = scan_setup(df_weekly, df_daily, df_4h, df_1h, df_15m)
+    scan = scan_setup(df_weekly, df_daily, df_4h, df_1h)
+
+    # ✅ الرمادي: توقف فوري — لا خيارات، لا شيء
+    if scan["color"] not in VALID_COLORS:
+        return {
+            "symbol": symbol.upper(),
+            "price": round(price, 2),
+            "card": {"color": "gray", "label": "لا إشارة",
+                     "status": "none", "direction": None, "stage": None},
+        }
 
     card = {
         "color":     scan["color"],
@@ -450,14 +491,7 @@ def analyze_symbol(symbol: str) -> dict:
 
     levels = scan.get("levels", {}) or {}
 
-    # ✅ FIX #7: للبطاقات الرمادية نختار الاتجاه حسب حركة السعر (وليس "bullish" ثابت)
-    if scan["color"] == "green":
-        direction_opt = "bullish"
-    elif scan["color"] == "red":
-        direction_opt = "bearish"
-    else:
-        direction_opt = "bullish" if price >= prev_close else "bearish"
-
+    direction_opt = "bullish" if scan["color"] == "green" else "bearish"
     opt = fetch_option_data(symbol, direction_opt, price, "swing")
 
     levels["strike"]  = opt.get("strike", "—")
@@ -468,8 +502,7 @@ def analyze_symbol(symbol: str) -> dict:
     sr = scan.get("support_resistance", {})
     timeframes = scan.get("timeframes", [])
 
-    supports = []
-    resistances = []
+    supports, resistances = [], []
     if sr.get("weekly"):
         if sr["weekly"].get("support"): supports.append(sr["weekly"]["support"])
         if sr["weekly"].get("resistance"): resistances.append(sr["weekly"]["resistance"])
@@ -486,7 +519,6 @@ def analyze_symbol(symbol: str) -> dict:
         "card": card,
         "levels": levels,
         "timeframes": timeframes,
-        "methods": scan.get("methods", []),
         "support_resistance": sr,
         "supports": supports,
         "resistances": resistances,
@@ -550,11 +582,12 @@ async def run_scan(scan_id: str):
                 print(f"[SCAN] {sym} error: {error}", flush=True)
                 scan["errors"].append({"symbol": sym, "error": error})
             elif data:
-                scan["results_map"][sym] = data
                 card = data.get("card", {})
                 color = card.get("color", "gray")
 
-                if color in ("green", "red"):
+                # ✅ الرمادي: لا نضيفه للنتائج نهائياً
+                if color in VALID_COLORS:
+                    scan["results_map"][sym] = data
                     scan["results"].append(data)
 
                     levels = data.get("levels", {})
@@ -587,11 +620,8 @@ async def run_scan(scan_id: str):
 
 def cleanup_old_scans():
     now = time.time()
-    to_delete = []
-    for sid, s in _scans.items():
-        if now - s.get("started_at", now) > _SCAN_TTL:
-            to_delete.append(sid)
-    for sid in to_delete:
+    for sid in [k for k, v in _scans.items()
+                if now - v.get("started_at", now) > _SCAN_TTL]:
         _scans.pop(sid, None)
 
 
