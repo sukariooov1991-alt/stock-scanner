@@ -13,7 +13,7 @@ let deletedSymbols = new Set();
 
 // ✅ منع تكرار طلب Gemini لنفس السهم
 const aiRequested = new Set();
-// ✅ قائمة انتظار طلبات Gemini (لتجنب إغراق الـ endpoint)
+// ✅ قائمة انتظار طلبات Gemini
 const aiQueue = [];
 let aiQueueRunning = false;
 
@@ -151,7 +151,7 @@ function monitorStatusLabel(s) {
 }
 
 /* ============================================================
-   ✅ Gemini — طلب التحليل بعد عرض البطاقة (Async, لا يعطّل شيئاً)
+   ✅ Gemini — طلب التحليل بعد عرض البطاقة (Async)
    ============================================================ */
 function enqueueAIRequest(symbol) {
   if (!symbol || aiRequested.has(symbol)) return;
@@ -181,8 +181,7 @@ async function runAIQueue() {
           }
         }
       }
-    } catch (e) { /* تجاهل أخطاء الشبكة */ }
-    // فاصل صغير بين الطلبات لتفادي rate-limit
+    } catch (e) { /* تجاهل */ }
     await new Promise(r => setTimeout(r, 800));
   }
   aiQueueRunning = false;
@@ -475,7 +474,6 @@ function buildCard(cardData) {
     await deleteCard(sym);
   });
 
-  // ✅ اطلب تحليل Gemini (Async — بعد ما ظهرت البطاقة كاملة)
   if (!cardData.ai_analysis) {
     enqueueAIRequest(sym);
   }
@@ -628,7 +626,6 @@ function renderCards() {
     emptyState.innerHTML = "<p>اضغط \"ابدأ المسح\" لفحص السوق</p>";
   }
 
-  // ✅ اطلب Gemini لأي بطاقة قديمة محمّلة من localStorage ليس لديها تحليل بعد
   filtered.forEach(cardData => {
     if (!cardData.ai_analysis) enqueueAIRequest(cardData.symbol);
   });
@@ -638,6 +635,11 @@ function renderCards() {
 async function startScan() {
   scanBtn.disabled = true;
   scanBtn.querySelector(".scan-btn-text").textContent = "جاري المسح...";
+
+  // ✅ إصلاح جوهري: مسح جديد = تجاهل الحذف اليدوي القديم
+  // لأن قرار الحذف كان على نتيجة مسح قديمة، ولا معنى له مع نتائج جديدة
+  deletedSymbols.clear();
+  saveDeleted();
 
   progressWrap.style.display = "block";
   progressFill.style.width = "0%";
@@ -685,7 +687,6 @@ function mergeScanResults(newResults) {
 
     const existing = existingMap.get(sym);
     if (existing) {
-      // نحتفظ بالتحليل الذكي إن وجد
       const aiText = existing.ai_analysis;
       Object.assign(existing, newCard);
       if (!existing.ai_analysis && aiText) existing.ai_analysis = aiText;
