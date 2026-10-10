@@ -6,7 +6,8 @@ main.py — Longbridge Options Radar Scanner
 + تحليل ذكي عبر Gemini (منفصل)
 + قائمة نظيفة: S&P 100 + Nasdaq 100 (ميجا + لارج كاب)
 + اختيار العقد: من الـ strikes الحقيقية، الأقرب لـ 2% OTM، مع تجربة بدائل
-+ OI/Whales تُجلب دائماً (لا return مبكر)
++ OI/Whales تُجلب دائماً
++ ✅ حماية من فشل quote (IndexError)
 """
 import os
 import time
@@ -38,7 +39,6 @@ _lb_config = Config.from_apikey_env()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# ✅ Gemini
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODELS  = [
     "gemini-3.8-flash",
@@ -57,19 +57,16 @@ _ANALYZE_TTL = 25
 _ai_cache: dict[str, tuple[float, str]] = {}
 _AI_CACHE_TTL = 1800
 
-# ✅ فلاتر العقد
 MAX_PREMIUM = 2.5
 MAX_SPREAD  = 0.10
 DTE_MIN     = 5
 DTE_MAX     = 20
 DTE_TARGET  = 10
-OTM_TARGET  = 0.02          # الهدف: 2% OTM
-MAX_CANDIDATES = 10         # كم strike نجرّب قبل الاستسلام
+OTM_TARGET  = 0.02
+MAX_CANDIDATES = 10
 
-# ✅ فلتر السعر الأدنى
 MIN_PRICE = 50.0
 
-# ✅ Cache
 _candle_cache: dict[str, tuple[float, list]] = {}
 _CANDLE_TTL = {"1h": 300, "4h": 900, "1d": 3600, "1w": 3600}
 _CANDLE_CACHE_MAX = 5000
@@ -88,11 +85,7 @@ DEAD_STATUSES = ("stop_hit", "target_hit", "expired")
 
 _TF_SECONDS = {"1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800}
 
-# ============================================================
-# ✅ قائمة نظيفة: S&P 100 + Nasdaq 100 (ميجا + لارج كاب)
-# ============================================================
 SCAN_SYMBOLS = list(dict.fromkeys([
-    # ── التكنولوجيا ──
     "AAPL", "MSFT", "NVDA", "GOOGL", "GOOG", "AMZN", "META", "AVGO",
     "TSLA", "ORCL", "CRM", "ADBE", "AMD", "INTC", "QCOM", "TXN",
     "CSCO", "IBM", "NOW", "INTU", "AMAT", "MU", "LRCX", "KLAC",
@@ -105,12 +98,8 @@ SCAN_SYMBOLS = list(dict.fromkeys([
     "MRVL", "ADI", "MSCI", "FIS", "FI", "GPN", "JKHY", "FFIV",
     "AKAM", "JNPR", "VRSN", "CTSH", "INFY", "WIT", "EPAM", "GLOB",
     "SSNC", "TYL", "PTC",
-
-    # ── الاتصالات والإعلام ──
     "NFLX", "DIS", "CMCSA", "CHTR", "TMUS", "VZ", "T", "EA",
     "TTWO", "RBLX", "PARA", "WBD", "FOXA", "FOX",
-
-    # ── البنوك والمالية ──
     "JPM", "BAC", "WFC", "C", "GS", "MS", "SCHW", "BLK", "BX",
     "KKR", "APO", "ARES", "OWL", "TPG", "CG", "USB", "PNC", "TFC",
     "MTB", "FITB", "HBAN", "RF", "KEY", "CFG", "STT", "BK",
@@ -118,14 +107,10 @@ SCAN_SYMBOLS = list(dict.fromkeys([
     "AON", "MCO", "ICE", "CME", "NDAQ", "CBOE", "MKTX", "TW",
     "CINF", "WRB", "L", "RE", "GL", "CNA", "HIG", "ACGL", "EG",
     "AIZ", "SYF", "DFS", "ALLY", "COF", "AXP", "V", "MA",
-
-    # ── الطاقة ──
     "XOM", "CVX", "COP", "EOG", "PXD", "DVN", "OXY", "HAL", "SLB",
     "BKR", "PSX", "VLO", "MPC", "KMI", "WMB", "OKE", "ET", "EPD",
     "PAA", "TRGP", "HES", "MRO", "APA", "CTRA", "FANG", "HESM",
     "DINO", "PBF", "DK", "PARR",
-
-    # ── الرعاية الصحية ──
     "LLY", "UNH", "JNJ", "ABBV", "MRK", "PFE", "TMO", "ABT",
     "DHR", "BMY", "AMGN", "GILD", "VRTX", "REGN", "BIIB", "ILMN",
     "IDXX", "A", "MTD", "WAT", "RMD", "HOLX", "COO", "EW",
@@ -133,40 +118,26 @@ SCAN_SYMBOLS = list(dict.fromkeys([
     "CRL", "IQV", "PKI", "RVTY", "BIO", "TECH", "QGEN", "HUM",
     "HCA", "MCK", "ABC", "CAH", "DGX", "LH", "BAX", "BDX",
     "CI", "ELV", "CVS", "MOH", "CNC", "VEEV", "DOCS",
-
-    # ── الاستهلاك ──
     "WMT", "COST", "HD", "LOW", "TGT", "KR", "SYY", "ADM",
     "GIS", "K", "HSY", "MKC", "CL", "KMB", "CHD", "EL",
     "YUM", "CMG", "DPZ", "WEN", "QSR", "DKNG", "MAR", "HLT",
     "H", "RCL", "CCL", "NCLH", "LUV", "DAL", "AAL", "UAL",
     "PG", "PEP", "KO", "MDLZ", "STZ", "TAP", "KHC",
-
-    # ── التجزئة ──
     "ORLY", "AZO", "AAP", "GPC", "LKQ", "ULTA", "BBY", "DKS",
     "ROST", "BURL", "M",
-
-    # ── الصناعة ──
     "GE", "BA", "CAT", "DE", "MMM", "HON", "LMT", "RTX", "GD",
     "NOC", "LHX", "HII", "TDG", "HEI", "TXT", "AXON", "WM",
     "RSG", "CMI", "PCAR", "EMR", "PH", "ROK", "DOV", "IR",
     "ITW", "ETN", "AME", "PWR", "GNRC", "VRT", "GEV",
-
-    # ── النقل ──
     "UNP", "CSX", "NSC", "UPS", "FDX", "ODFL", "XPO", "CHRW",
     "EXPD", "JBHT", "KNX",
-
-    # ── المرافق ──
     "NEE", "DUK", "SO", "D", "AEP", "EXC", "XEL", "SRE", "PEG",
     "ED", "WEC", "ES", "AEE", "DTE", "PPL", "FE", "ETR", "CMS",
     "CNP", "NI", "AES", "NRG", "VST", "CEG", "PSEG", "PNW",
     "LNT", "EVRG", "OGE", "PCG", "EIX", "AWK", "WTRG",
-
-    # ── مواد ──
     "LIN", "APD", "SHW", "ECL", "NEM", "FCX", "NUE", "STLD",
     "DOW", "LYB", "PPG", "IFF", "ALB", "CE", "DD", "VMC",
     "MLM", "IP", "PKG",
-
-    # ── عقارات ──
     "PLD", "AMT", "EQIX", "CCI", "PSA", "O", "SPG", "VICI",
     "WELL", "DLR", "AVB", "EQR", "MAA", "ESS", "UDR", "CPT",
 ]))
@@ -186,6 +157,21 @@ def get_ctx():
 def norm(symbol: str) -> str:
     s = symbol.strip().upper().replace("-", ".")
     return s if "." in s else f"{s}.US"
+
+
+def _safe_quote(symbol: str) -> tuple[float | None, float | None]:
+    """
+    ✅ حماية: يُرجع (price, prev_close) أو (None, None) إذا فشل.
+    """
+    try:
+        q_list = get_ctx().quote([norm(symbol)])
+        if not q_list:
+            return None, None
+        q = q_list[0]
+        return float(q.last_done), float(q.prev_close)
+    except Exception as e:
+        print(f"[QUOTE] {symbol}: {e}", flush=True)
+        return None, None
 
 
 def send_telegram_alert(message: str) -> bool:
@@ -278,7 +264,6 @@ def _call_gemini_once(prompt: str, model: str) -> str | None:
             return None
         d = r.json()
         if d.get("promptFeedback", {}).get("blockReason"):
-            print(f"[GEMINI] {model} blocked: {d['promptFeedback']['blockReason']}", flush=True)
             return None
         cands = d.get("candidates") or []
         if not cands:
@@ -388,15 +373,7 @@ def fetch_candles(symbol, timeframe, count=200):
 
 
 def get_current_price(symbol: str):
-    try:
-        ctx = get_ctx()
-        sym = norm(symbol)
-        q = ctx.quote([sym])
-        if q:
-            return float(q[0].last_done)
-    except Exception:
-        pass
-    return None
+    return _safe_quote(symbol)[0]
 
 
 # ============================================================
@@ -437,7 +414,6 @@ def _empty_option_result():
 
 
 def _quote_one(ctx, sym_opt):
-    """يجلب اقتباس عقد واحد، يعيد dict أو None."""
     try:
         oqs = ctx.option_quote([sym_opt])
         if not oqs:
@@ -459,7 +435,6 @@ def _quote_one(ctx, sym_opt):
 
 
 def _try_strike(ctx, opt_sym):
-    """يجرّب عقداً واحداً، يعيد (pass, premium, spread, delta, reason)."""
     if not opt_sym:
         return False, None, None, None, "no_symbol"
     q = _quote_one(ctx, opt_sym)
@@ -482,12 +457,6 @@ def _try_strike(ctx, opt_sym):
 
 
 def fetch_option_data(symbol, direction, price, strategy="swing"):
-    """
-    يجلب بيانات الخيارات:
-    - يجرّب أقرب الـ strikes الحقيقية للهدف (2% OTM)
-    - يقبل أول عقد يستوفي الفلاتر (سعر + سبريد)
-    - يجلب OI/Whales دائماً (بغض النظر عن نجاح العقد)
-    """
     ctx = get_ctx()
     sym = norm(symbol)
     result = _empty_option_result()
@@ -537,7 +506,6 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
         is_call = (direction == "bullish")
         target_price = price * (1 + OTM_TARGET) if is_call else price * (1 - OTM_TARGET)
 
-        # ✅ 1) اجمع كل الـ strikes الحقيقية
         if is_call:
             cands = [c for c in chain if _call_of(c) and _strike_of(c) > price]
         else:
@@ -545,12 +513,8 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
 
         if not cands:
             result["filter_reason"] = "no_call_strike" if is_call else "no_put_strike"
-            # ⚠️ نكمل لجلب OI/Whales — لا نتوقف
         else:
-            # ✅ 2) رتّب بالأقرب للهدف
             cands.sort(key=lambda c: abs(_strike_of(c) - target_price))
-
-            # ✅ 3) جرّب كل مرشح حتى نجد عقداً مقبولاً
             chosen = None
             for c in cands[:MAX_CANDIDATES]:
                 sk = _strike_of(c)
@@ -564,21 +528,16 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
                     result["filter_pass"] = True
                     break
                 else:
-                    # سجّل آخر سبب فشل
                     result["filter_reason"] = f"{reason} @ {int(sk)}"
-
             if chosen:
                 result["strike"] = f"{'C' if is_call else 'P'} {int(chosen['strike'])}"
                 result["premium"] = chosen["premium"]
                 if chosen["delta"] is not None:
                     result["delta"] = chosen["delta"]
-                # احتفظ بالرمز لاستخدامه لاحقاً في التحليل
-                result["_opt_sym"] = chosen["sym"]
             else:
-                # لم نجد عقداً مقبولاً — لكن نكمل
                 result["filter_reason"] = result["filter_reason"] or "no_suitable_contract"
 
-        # ✅ 4) اجلب OI/Volume/Whales دائماً
+        # OI/Whales دائماً
         strikes_map = {}
         for c in chain:
             sk = _strike_of(c)
@@ -588,14 +547,11 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
             ps = _put_of(c)  or build_put_sym(sk)
             strikes_map[sk] = (cs, ps)
 
-        # للعرض: 5 CALL فوق السعر + 5 PUT تحت السعر
         calls_above = sorted([s for s in strikes_map.keys() if s > price])[:NEARBY_STRIKES]
         puts_below  = sorted([s for s in strikes_map.keys() if s < price],
                               reverse=True)[:NEARBY_STRIKES]
-
         display_strikes = sorted(set(calls_above + puts_below))
 
-        # اجمع كل الرموز المطلوبة
         all_syms_set = set()
         for sk in display_strikes:
             cs, ps = strikes_map.get(sk, (None, None))
@@ -611,7 +567,6 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
                     for q in qs: qmap[q.symbol] = q
             except Exception: pass
 
-        # إجماليات CALL / PUT (من عيّنة العرض)
         tc_oi = tp_oi = tc_v = tp_v = 0
         cd = []
         for sk in sorted(display_strikes, reverse=True):
@@ -644,7 +599,6 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
         result["call_oi"] = cd
         result["put_oi"]  = pd_
 
-        # الحيتان
         whales = []
         for sk in display_strikes:
             cs, ps = strikes_map.get(sk, (None, None))
@@ -672,7 +626,6 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
         print(f"[OPT] {symbol} {e}", flush=True)
         result["filter_reason"] = f"exception: {e}"
 
-    result.pop("_opt_sym", None)
     return result
 
 
@@ -705,21 +658,25 @@ def _is_dead_signal(scan: dict, price: float) -> bool:
 
 
 # ============================================================
-# analyze_symbol — مع فلتر السعر
+# analyze_symbol
 # ============================================================
 def analyze_symbol(symbol: str) -> dict:
-    q = get_ctx().quote([norm(symbol)])[0]
-    price = float(q.last_done)
-    prev_close = float(q.prev_close)
+    # ✅ حماية: إذا فشل quote → رمادي (وليس IndexError)
+    price, prev_close = _safe_quote(symbol)
+    if price is None:
+        return _gray_result(symbol, 0.0)
 
-    # ✅ رفض الأسهم الرخيصة (قبل جلب الشموع — توفير كبير)
     if price < MIN_PRICE:
         return _gray_result(symbol, price)
 
-    df_weekly = candles_to_df(fetch_candles(symbol, "1w", 150), "1w")
-    df_daily  = candles_to_df(fetch_candles(symbol, "1d", 400), "1d")
-    df_4h     = candles_to_df(fetch_candles(symbol, "4h", 200), "4h")
-    df_1h     = candles_to_df(fetch_candles(symbol, "1h", 200), "1h")
+    try:
+        df_weekly = candles_to_df(fetch_candles(symbol, "1w", 150), "1w")
+        df_daily  = candles_to_df(fetch_candles(symbol, "1d", 400), "1d")
+        df_4h     = candles_to_df(fetch_candles(symbol, "4h", 200), "4h")
+        df_1h     = candles_to_df(fetch_candles(symbol, "1h", 200), "1h")
+    except Exception as e:
+        print(f"[CANDLES] {symbol}: {e}", flush=True)
+        return _gray_result(symbol, price)
 
     scan = scan_setup(df_weekly, df_daily, df_4h, df_1h)
 
@@ -757,9 +714,9 @@ def analyze_symbol(symbol: str) -> dict:
     return {
         "symbol": symbol.upper(),
         "price": round(price, 2),
-        "prevClose": round(prev_close, 2),
-        "change": round(price - prev_close, 2),
-        "changePercent": round((price - prev_close) / prev_close * 100, 2) if prev_close else 0,
+        "prevClose": round(prev_close or price, 2),
+        "change": round(price - (prev_close or price), 2),
+        "changePercent": round((price - (prev_close or price)) / (prev_close or price) * 100, 2) if prev_close else 0,
         "card": card,
         "levels": levels,
         "timeframes": timeframes,
@@ -1018,8 +975,7 @@ def test_gemini():
         return {"ok": False, "reason": "GEMINI_API_KEY not set",
                 "models_tried": GEMINI_MODELS}
     sample = {
-        "symbol": "TEST",
-        "price": 100.0,
+        "symbol": "TEST", "price": 100.0,
         "card": {"color": "green", "stage": "daily_break_weekly"},
         "levels": {"entry": 100, "stop": 98, "target1": 104, "rr": 2.0,
                    "level_broken": 99, "pattern": "hammer"},
@@ -1164,6 +1120,7 @@ def cache_stats():
         "max_spread": MAX_SPREAD,
         "gemini_enabled": bool(GEMINI_API_KEY),
         "gemini_models": GEMINI_MODELS,
+        "scans_in_memory": len(_scans),
     }
 
 
