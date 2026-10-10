@@ -1,9 +1,9 @@
 """
 main.py — Longbridge Options Radar Scanner
 النسخة النهائية — 4 فريمات، مساران، حذف الرمادي نهائياً
-+ توحيد صريح للأوقات: time = بداية الشمعة، close_time = نهاية الشمعة
-+ رفض الإشارات الميتة فوراً (السعر عند الوقف أو الهدف)
-+ حذف فوري للميتة من كل الطبقات
++ توحيد صريح للأوقات
++ رفض الإشارات الميتة
++ تحليل ذكي عبر Gemini (نص عربي لكل بطاقة)
 """
 import os
 import time
@@ -35,11 +35,19 @@ _lb_config = Config.from_apikey_env()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+# ✅ Gemini
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODELS  = ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash"]
+GEMINI_TIMEOUT = 12
+
 _quote_ctx: QuoteContext | None = None
 _event_loop: asyncio.AbstractEventLoop | None = None
 _subscribed: set[str] = set()
 _analyze_cache: dict[str, tuple[float, dict]] = {}
 _ANALYZE_TTL = 25
+
+_ai_cache: dict[str, tuple[float, str]] = {}
+_AI_CACHE_TTL = 1800  # 30 دقيقة
 
 # ✅ فلاتر العقد
 MAX_PREMIUM = 2.5
@@ -66,11 +74,8 @@ NEARBY_STRIKES = 5
 OPTION_QUOTE_BATCH = 50
 
 VALID_COLORS = ("green", "red")
-
-# حالات المراقبة التي تعني "الصفقة انتهت"
 DEAD_STATUSES = ("stop_hit", "target_hit", "expired")
 
-# ثواني كل إطار
 _TF_SECONDS = {"1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800}
 
 SCAN_SYMBOLS = list(dict.fromkeys([
@@ -157,13 +162,115 @@ def send_telegram_alert(message: str) -> bool:
         return False
 
 
+# ============================================================
+# Gemini — تحليل ذكي
+# ============================================================
+def _build_ai_prompt(data: dict) -> str:
+    sym = data.get("symbol", "")
+    card = data.get("card", {}) or {}
+    lv = data.get("levels", {}) or {}
+    bi = data.get("break_info", {}) or {}
+    tfs = data.get("timeframes", []) or []
+
+    tf_lines = []
+    for t in tfs:
+        if t.get("broke_resistance"):
+            st = "مخترق صعوداً"
+        elif t.get("broke_support"):
+            st = "مكسور هبوطاً"
+        else:
+            st = "محايد"
+        tf_lines.append(
+            f"- {t.get('label')}: مقاومة {t.get('resistance')} / "
+            f"دعم {t.get('support')} / {st}"
+        )
+
+    direction_txt = "CALL (صاعد)" if card.get("color") == "green" else "PUT (هابط)"
+    stage_txt = {
+        "daily_break_weekly": "إغلاق يومي خارج قمة/قاع الأسبوع السابق",
+        "4h_break_daily": "إغلاق 4H خارج قمة/قاع اليوم السابق",
+    }.get(card.get("stage"), "—")
+
+    return f"""أنت محلل فني محترف لأسواق الأسهم والخيارات الأمريكية.
+حلّل هذه الإشارة الفنية بإيجاز شديد في 3-4 أسطر عربية فقط.
+ركّز على: قوة الزخم، جودة الاختراق، الثبات، السياق العام، وأهم مخاطبة أو مخاطرة.
+لا تكرر الأرقام حرفياً، ولا تستخدم Markdown، ولا رموز تعبيرية، ولا عناوين.
+اكتب نصاً متصلاً كأنك تخاطب متداولاً محترفاً.
+
+البيانات:
+- الرمز: {sym}
+- الاتجاه: {direction_txt}
+- المرحلة: {stage_txt}
+- مستوى الاختراق: {lv.get('level_broken')}
+- سعر الدخول: {lv.get('entry')}
+- الوقف: {lv.get('stop')}
+- الهدف: {lv.get('target1')}
+- R:R: {lv.get('rr')}
+- RVOL عند الاختراق: {bi.get('rvol')}
+- نمط شمعة التأكيد: {lv.get('pattern')}
+- السعر الحالي: {data.get('price')}
+
+الفريمات:
+{chr(10).join(tf_lines)}
+
+اكتب 3-4 أسطر فقط.
+"""
+
+
+def _call_gemini_once(prompt: str, model: str) -> str | None:
+    if not GEMINI_API_KEY:
+        return None
+    try:
+        url = (f"https://generativelanguage.googleapis.com/v1beta/"
+               f"models/{model}:generateContent?key={GEMINI_API_KEY}")
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.7,
+                "maxOutputTokens": 260,
+                "topP": 0.95,
+            },
+        }
+        r = requests.post(url, json=payload, timeout=GEMINI_TIMEOUT)
+        if r.status_code != 200:
+            print(f"[GEMINI] {model} HTTP {r.status_code}: {r.text[:200]}", flush=True)
+            return None
+        d = r.json()
+        if d.get("promptFeedback", {}).get("blockReason"):
+            print(f"[GEMINI] {model} blocked: {d['promptFeedback']['blockReason']}", flush=True)
+            return None
+        cands = d.get("candidates") or []
+        if not cands:
+            return None
+        parts = (cands[0].get("content") or {}).get("parts") or []
+        text = "".join(p.get("text", "") for p in parts).strip()
+        return text or None
+    except Exception as e:
+        print(f"[GEMINI] {model} exception: {e}", flush=True)
+        return None
+
+
+def get_ai_analysis(data: dict) -> str | None:
+    sym = (data.get("symbol") or "").upper().strip()
+    if not GEMINI_API_KEY or not sym:
+        return None
+    now = time.time()
+    cached = _ai_cache.get(sym)
+    if cached and now - cached[0] < _AI_CACHE_TTL:
+        return cached[1]
+    prompt = _build_ai_prompt(data)
+    for model in GEMINI_MODELS:
+        text = _call_gemini_once(prompt, model)
+        if text:
+            _ai_cache[sym] = (now, text)
+            return text
+    return None
+
+
+# ============================================================
+# تحويل الشموع
+# ============================================================
 def candles_to_df(candles, timeframe=None):
-    """
-    تحويل الشموع إلى DataFrame بأوقات موحّدة:
-      - time:       وقت بداية الشمعة.
-      - close_time: وقت إغلاق الشمعة = البداية + مدة الإطار.
-    تُستبعد كل شمعة لم يكتمل وقت إغلاقها.
-    """
     import pandas as pd
     rows = [{
         "time": c.timestamp, "open": float(c.open), "high": float(c.high),
@@ -294,7 +401,6 @@ def _pick_strike(candidates, price, target_pct, is_call):
     target_price = price * (1 + target_pct) if is_call else price * (1 - target_pct)
     lo = price * (1 + OTM_MIN_PCT) if is_call else price * (1 - OTM_MAX_PCT)
     hi = price * (1 + OTM_MAX_PCT) if is_call else price * (1 - OTM_MIN_PCT)
-
     in_range = [c for c in candidates if lo <= _strike_of(c) <= hi]
     if not in_range:
         return None
@@ -359,9 +465,7 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
             if best is None:
                 result["filter_reason"] = "no_call_strike"
                 return result
-            option_symbol = _call_of(best)
-            strike = _strike_of(best)
-            opt_type = "C"
+            option_symbol = _call_of(best); strike = _strike_of(best); opt_type = "C"
         else:
             cands = [c for c in chain if _put_of(c) and _strike_of(c) < price]
             if not cands:
@@ -371,9 +475,7 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
             if best is None:
                 result["filter_reason"] = "no_put_strike"
                 return result
-            option_symbol = _put_of(best)
-            strike = _strike_of(best)
-            opt_type = "P"
+            option_symbol = _put_of(best); strike = _strike_of(best); opt_type = "P"
 
         result["strike"] = f"{opt_type} {int(strike)}"
 
@@ -386,18 +488,15 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
                     v = getattr(oq, attr, None)
                     if v is not None:
                         try:
-                            last = float(v)
-                            break
+                            last = float(v); break
                         except (TypeError, ValueError):
                             continue
-
                 bid = float(getattr(oq, "bid", 0) or 0)
                 ask = float(getattr(oq, "ask", 0) or 0)
                 spread = (ask - bid) if ask > bid > 0 else 999
                 entry_premium = ask if ask > 0 else last
                 if entry_premium is not None:
                     result["premium"] = round(entry_premium, 2)
-
                 if entry_premium is None:
                     result["filter_reason"] = "no_premium"
                 elif entry_premium > MAX_PREMIUM:
@@ -406,7 +505,6 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
                     result["filter_reason"] = f"spread_too_wide ({spread:.2f})"
                 else:
                     result["filter_pass"] = True
-
                 if hasattr(oq, "delta"):
                     result["delta"] = round(float(oq.delta), 3)
         except Exception as e:
@@ -414,12 +512,10 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
 
         calls_above = sorted(
             [c for c in chain if _strike_of(c) > price and _call_of(c)],
-            key=lambda c: _strike_of(c)
-        )[:NEARBY_STRIKES]
+            key=lambda c: _strike_of(c))[:NEARBY_STRIKES]
         puts_below = sorted(
             [c for c in chain if _strike_of(c) < price and _put_of(c)],
-            key=lambda c: -_strike_of(c)
-        )[:NEARBY_STRIKES]
+            key=lambda c: -_strike_of(c))[:NEARBY_STRIKES]
 
         strikes_map = {}
         for c in calls_above:
@@ -453,8 +549,8 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
                 tp_oi += int(getattr(q, "open_interest", 0) or 0)
                 tp_v  += int(getattr(q, "volume", 0) or 0)
 
-        result["total_call_oi"]  = tc_oi
-        result["total_put_oi"]   = tp_oi
+        result["total_call_oi"] = tc_oi
+        result["total_put_oi"]  = tp_oi
         result["total_call_vol"] = tc_v
         result["total_put_vol"]  = tp_v
 
@@ -504,7 +600,7 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
 
 
 # ============================================================
-# رفض الإشارات الميتة — تُعيد "gray" (محذوفة في كل الطبقات)
+# رفض الإشارات الميتة
 # ============================================================
 def _gray_result(symbol: str, price: float) -> dict:
     return {
@@ -516,21 +612,14 @@ def _gray_result(symbol: str, price: float) -> dict:
 
 
 def _is_dead_signal(scan: dict, price: float) -> bool:
-    """
-    ✅ إصلاح النقطة 1: إذا السعر الحالي وصل الوقف أو الهدف → الصفقة ميتة.
-    - CALL: ميتة إذا (price <= stop) أو (price >= target1)
-    - PUT:  ميتة إذا (price >= stop) أو (price <= target1)
-    """
     if scan.get("color") not in VALID_COLORS:
         return False
     lv = scan.get("levels", {}) or {}
-    stop_p = lv.get("stop")
-    tgt_p = lv.get("target1")
+    stop_p = lv.get("stop"); tgt_p = lv.get("target1")
     if stop_p is None or tgt_p is None:
         return False
     try:
-        sp = float(stop_p)
-        tp = float(tgt_p)
+        sp = float(stop_p); tp = float(tgt_p)
     except (TypeError, ValueError):
         return False
     if scan["color"] == "green":
@@ -553,7 +642,6 @@ def analyze_symbol(symbol: str) -> dict:
 
     scan = scan_setup(df_weekly, df_daily, df_4h, df_1h)
 
-    # ✅ إصلاح النقطة 1: رفض الرمادي + رفض الإشارات الميتة
     if scan["color"] not in VALID_COLORS or _is_dead_signal(scan, price):
         return _gray_result(symbol, price)
 
@@ -566,7 +654,6 @@ def analyze_symbol(symbol: str) -> dict:
     }
 
     levels = scan.get("levels", {}) or {}
-
     direction_opt = "bullish" if scan["color"] == "green" else "bearish"
     opt = fetch_option_data(symbol, direction_opt, price, "swing")
 
@@ -586,7 +673,7 @@ def analyze_symbol(symbol: str) -> dict:
         if sr["daily"].get("support"): supports.append(sr["daily"]["support"])
         if sr["daily"].get("resistance"): resistances.append(sr["daily"]["resistance"])
 
-    return {
+    result = {
         "symbol": symbol.upper(),
         "price": round(price, 2),
         "prevClose": round(prev_close, 2),
@@ -598,6 +685,7 @@ def analyze_symbol(symbol: str) -> dict:
         "support_resistance": sr,
         "supports": supports,
         "resistances": resistances,
+        "break_info": scan.get("break_info", {}),
         "call_oi": opt.get("call_oi", []),
         "put_oi":  opt.get("put_oi", []),
         "total_call_oi":  opt.get("total_call_oi", 0),
@@ -609,6 +697,16 @@ def analyze_symbol(symbol: str) -> dict:
         "filter_reason": opt.get("filter_reason", ""),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+    # ✅ تحليل ذكي (Gemini)
+    try:
+        ai_text = get_ai_analysis(result)
+        if ai_text:
+            result["ai_analysis"] = ai_text
+    except Exception as e:
+        print(f"[AI] {symbol}: {e}", flush=True)
+
+    return result
 
 
 def analyze_cached(symbol):
@@ -623,9 +721,6 @@ def analyze_cached(symbol):
     return data
 
 
-# ============================================================
-# ✅ إصلاح النقطة 2: حذف الرمز من كل المسحات عند موت الصفقة
-# ============================================================
 def _purge_symbol_from_scans(symbol: str):
     sym = symbol.upper().strip()
     for scan in _scans.values():
@@ -737,7 +832,6 @@ async def monitor_task():
                 if now >= m["expires_at"]:
                     m["status"] = "expired"
                     m["ended_at"] = now
-                    # ✅ إصلاح النقطة 2
                     _purge_symbol_from_scans(sym)
                     await asyncio.to_thread(
                         send_telegram_alert,
@@ -748,9 +842,7 @@ async def monitor_task():
                 price = await asyncio.to_thread(get_current_price, sym)
                 if price is None: continue
                 m["last_price"] = price
-                direction = m["direction"]
-                target = m["target"]
-                stop = m["stop"]
+                direction = m["direction"]; target = m["target"]; stop = m["stop"]
 
                 if "target" not in m["alerts_sent"]:
                     hit = (direction == "call" and price >= target) or \
@@ -759,12 +851,10 @@ async def monitor_task():
                         m["status"] = "target_hit"
                         m["ended_at"] = now
                         m["alerts_sent"].add("target")
-                        # ✅ إصلاح النقطة 2
                         _purge_symbol_from_scans(sym)
                         await asyncio.to_thread(
                             send_telegram_alert,
-                            f"✅ <b>تحقق الهدف</b> — {sym}\nالسعر: ${price:.2f}\nالهدف: ${target:.2f}"
-                        )
+                            f"✅ <b>تحقق الهدف</b> — {sym}\nالسعر: ${price:.2f}\nالهدف: ${target:.2f}")
                         continue
 
                 if "stop" not in m["alerts_sent"]:
@@ -774,12 +864,10 @@ async def monitor_task():
                         m["status"] = "stop_hit"
                         m["ended_at"] = now
                         m["alerts_sent"].add("stop")
-                        # ✅ إصلاح النقطة 2
                         _purge_symbol_from_scans(sym)
                         await asyncio.to_thread(
                             send_telegram_alert,
-                            f"❌ <b>ضرب الوقف</b> — {sym}\nالسعر: ${price:.2f}\nالوقف: ${stop:.2f}"
-                        )
+                            f"❌ <b>ضرب الوقف</b> — {sym}\nالسعر: ${price:.2f}\nالوقف: ${stop:.2f}")
                         continue
         except Exception as e:
             print(f"[MONITOR] error: {e}", flush=True)
@@ -797,6 +885,10 @@ async def lifespan(app: FastAPI):
         ctx = get_ctx()
         ctx.set_on_quote(_on_quote)
         print("[STARTUP] ready", flush=True)
+        if GEMINI_API_KEY:
+            print("[STARTUP] Gemini key detected", flush=True)
+        else:
+            print("[STARTUP] Gemini key MISSING — AI analysis disabled", flush=True)
     except Exception as e:
         print(f"[STARTUP] error: {e}", flush=True)
 
@@ -848,6 +940,28 @@ def test_telegram():
     return {"sent": ok, "configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)}
 
 
+@app.get("/api/test-gemini")
+def test_gemini():
+    if not GEMINI_API_KEY:
+        return {"ok": False, "reason": "GEMINI_API_KEY not set"}
+    sample = {
+        "symbol": "TEST",
+        "price": 100.0,
+        "card": {"color": "green", "stage": "daily_break_weekly"},
+        "levels": {"entry": 100, "stop": 98, "target1": 104, "rr": 2.0,
+                   "level_broken": 99, "pattern": "hammer"},
+        "break_info": {"rvol": 1.8},
+        "timeframes": [
+            {"label": "1W", "support": 95, "resistance": 99, "broke_resistance": True},
+            {"label": "1D", "support": 97, "resistance": 99, "broke_resistance": True},
+            {"label": "4H", "support": 98, "resistance": 101, "broke_resistance": False},
+            {"label": "1H", "support": 99, "resistance": 102, "broke_resistance": False},
+        ],
+    }
+    text = get_ai_analysis(sample)
+    return {"ok": bool(text), "text": text}
+
+
 @app.get("/api/symbols")
 def get_symbols():
     return {"total": len(SCAN_SYMBOLS), "symbols": SCAN_SYMBOLS}
@@ -876,7 +990,6 @@ def scan_status(scan_id: str):
     for r in scan["results"]:
         sym = r.get("symbol")
         m = _monitoring.get(sym, {})
-        # ✅ إصلاح النقطة 3: لا نُرسل الصفقات الميتة
         if m.get("status") in DEAD_STATUSES:
             continue
         r_copy = dict(r)
@@ -942,10 +1055,10 @@ def cache_stats():
     return {
         "candle_cache_size": len(_candle_cache),
         "analyze_cache_size": len(_analyze_cache),
+        "ai_cache_size": len(_ai_cache),
         "monitoring_count": len(_monitoring),
         "symbols_total": len(SCAN_SYMBOLS),
-        "max_premium": MAX_PREMIUM,
-        "max_spread": MAX_SPREAD,
+        "gemini_enabled": bool(GEMINI_API_KEY),
     }
 
 
