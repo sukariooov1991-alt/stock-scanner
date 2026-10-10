@@ -1,121 +1,38 @@
 /* ============================================================
-   app.js — Longbridge Scanner (النسخة النهائية + Gemini async)
-   + معالجة 404 (المسح فُقد بعد إعادة تشغيل السيرفر)
+   app.js — Longbridge Options Radar (Cascade Break & Retest)
+   البحث اليدوي + Gemini + مربعات الاستراتيجية
    ============================================================ */
 const API_BASE = window.location.origin;
+let cards = [];
+const socketMap = new Map();
+const reconnectTimers = new Map();
+const stateTimers = new Map();
+let pollTimer = null;
 
-let currentScan = null;
-let scanCards = [];
-let scanTimer = null;
-let monitorTimers = new Map();
-let pricePollTimer = null;
-let lastAlertedState = {};
-let deletedSymbols = new Set();
-
+const lastAlertedState = {};
 const aiRequested = new Set();
 const aiQueue = [];
 let aiQueueRunning = false;
 
-// ✅ عدّاد فشل polling — إذا فشل 3 مرات، نتوقف
-let pollFailures = 0;
-const MAX_POLL_FAILURES = 3;
-
 const VALID_COLORS = ["green", "red"];
-const DEAD_STATUSES = ["stop_hit", "target_hit", "expired"];
 
-/* ===== Storage ===== */
-function saveDeleted() {
-  try { localStorage.setItem("scanner_deleted", JSON.stringify([...deletedSymbols])); } catch (e) {}
-}
-function loadDeleted() {
-  try {
-    const r = localStorage.getItem("scanner_deleted");
-    if (r) deletedSymbols = new Set(JSON.parse(r));
-  } catch (e) {}
-}
 function saveCards() {
-  try {
-    const filtered = scanCards
-      .filter(c => VALID_COLORS.includes(c.card?.color))
-      .filter(c => !DEAD_STATUSES.includes(c.monitor_status));
-    localStorage.setItem("scanner_cards", JSON.stringify(filtered));
-  } catch (e) {}
+  try { localStorage.setItem("stock_cards", JSON.stringify(cards)); } catch (e) {}
 }
 function loadCards() {
-  try {
-    const r = localStorage.getItem("scanner_cards");
-    if (!r) return [];
-    const arr = JSON.parse(r);
-    return arr
-      .filter(c => VALID_COLORS.includes(c.card?.color))
-      .filter(c => !DEAD_STATUSES.includes(c.monitor_status));
-  } catch (e) { return []; }
+  try { const r = localStorage.getItem("stock_cards"); return r ? JSON.parse(r) : []; }
+  catch (e) { return []; }
 }
 
-/* ===== Utils ===== */
-function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-/* ===== DOM ===== */
 const cardsArea = document.getElementById("cardsArea");
 const emptyState = document.getElementById("emptyState");
+const searchForm = document.getElementById("searchForm");
+const symbolInput = document.getElementById("symbolInput");
 const themeBtn = document.getElementById("themeBtn");
 const themeIcon = document.getElementById("themeIcon");
 const marketStatus = document.getElementById("marketStatus");
 const connectionStatus = document.getElementById("connectionStatus");
-const scanBtn = document.getElementById("scanBtn");
-const scanCancelBtn = document.getElementById("scanCancelBtn");
-const progressWrap = document.getElementById("progressWrap");
-const progressFill = document.getElementById("progressFill");
-const progressText = document.getElementById("progressText");
-const progressFound = document.getElementById("progressFound");
-const totalSymbols = document.getElementById("totalSymbols");
 
-/* ===== Theme ===== */
-function applyTheme(light) {
-  document.body.classList.toggle("light", light);
-  themeIcon.textContent = light ? "☀️" : "🌙";
-  localStorage.setItem("theme", light ? "light" : "dark");
-}
-themeBtn.addEventListener("click", () => applyTheme(!document.body.classList.contains("light")));
-applyTheme(localStorage.getItem("theme") === "light");
-
-/* ===== Market ===== */
-function updateMarketStatus() {
-  const now = new Date();
-  const nyH = (now.getUTCHours() - 4 + 24) % 24;
-  const total = nyH * 60 + now.getUTCMinutes();
-  let label = "", cls = "status";
-  if (total >= 570 && total < 960)       { label = "السوق مفتوح";    cls += " online"; }
-  else if (total >= 240 && total < 570)  { label = "قبل الافتتاح";   cls += " pre"; }
-  else if (total >= 960 && total < 1200) { label = "بعد الإغلاق";    cls += " after"; }
-  else                                    { label = "التداول الليلي"; cls += " overnight"; }
-  marketStatus.className = cls;
-  marketStatus.querySelector(".label").textContent = label;
-}
-updateMarketStatus();
-setInterval(updateMarketStatus, 60000);
-
-/* ===== Connection ===== */
-function setConnection(online) {
-  connectionStatus.className = "status " + (online ? "online" : "offline");
-  connectionStatus.querySelector(".label").textContent = online ? "متصل" : "غير متصل";
-}
-async function checkBackendStatus() {
-  try {
-    const r = await fetch(`${API_BASE}/api/status`);
-    const d = await r.json();
-    setConnection(!!d.connected);
-  } catch (e) { setConnection(false); }
-}
-
-/* ===== Sound ===== */
 function playAlertSound(type) {
   try {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -139,18 +56,39 @@ function checkSound(symbol, color) {
   lastAlertedState[symbol] = color;
 }
 
-/* ===== Labels ===== */
-function stageLabel(stage) {
-  if (stage === "daily_break_weekly") return "اليومي اخترق الأسبوع";
-  if (stage === "4h_break_daily")     return "4H اخترق اليوم";
-  return "";
+function applyTheme(light) {
+  document.body.classList.toggle("light", light);
+  themeIcon.textContent = light ? "☀️" : "🌙";
+  localStorage.setItem("theme", light ? "light" : "dark");
 }
-function monitorStatusLabel(s) {
-  if (s === "target_hit") return { label: "✅ هدف", cls: "ms-target" };
-  if (s === "stop_hit")   return { label: "❌ وقف",  cls: "ms-stop" };
-  if (s === "expired")    return { label: "⏰ منتهي", cls: "ms-expired" };
-  if (s === "active")     return { label: "🟢 مراقبة", cls: "ms-active" };
-  return { label: "", cls: "" };
+themeBtn.addEventListener("click", () => applyTheme(!document.body.classList.contains("light")));
+applyTheme(localStorage.getItem("theme") === "light");
+
+function updateMarketStatus() {
+  const now = new Date();
+  const nyH = (now.getUTCHours() - 4 + 24) % 24;
+  const total = nyH * 60 + now.getUTCMinutes();
+  let label = "", cls = "status";
+  if (total >= 570 && total < 960)       { label = "السوق مفتوح";    cls += " online"; }
+  else if (total >= 240 && total < 570)  { label = "قبل الافتتاح";   cls += " pre"; }
+  else if (total >= 960 && total < 1200) { label = "بعد الإغلاق";    cls += " after"; }
+  else                                    { label = "التداول الليلي"; cls += " overnight"; }
+  marketStatus.className = cls;
+  marketStatus.querySelector(".label").textContent = label;
+}
+updateMarketStatus();
+setInterval(updateMarketStatus, 60000);
+
+function setConnection(online) {
+  connectionStatus.className = "status " + (online ? "online" : "offline");
+  connectionStatus.querySelector(".label").textContent = online ? "متصل" : "غير متصل";
+}
+async function checkBackendStatus() {
+  try {
+    const r = await fetch(`${API_BASE}/api/status`);
+    const d = await r.json();
+    setConnection(!!d.connected);
+  } catch (e) { setConnection(false); }
 }
 
 /* ===== Gemini Queue ===== */
@@ -160,7 +98,6 @@ function enqueueAIRequest(symbol) {
   aiQueue.push(symbol);
   if (!aiQueueRunning) runAIQueue();
 }
-
 async function runAIQueue() {
   aiQueueRunning = true;
   while (aiQueue.length > 0) {
@@ -170,7 +107,7 @@ async function runAIQueue() {
       if (r.ok) {
         const d = await r.json();
         if (d.ok && d.text) {
-          const card = scanCards.find(c => c.symbol === sym);
+          const card = cards.find(c => c.symbol === sym);
           if (card) {
             card.ai_analysis = d.text;
             const el = cardsArea.querySelector(`[data-symbol="${sym}"]`);
@@ -210,10 +147,7 @@ function updateOIBlockData(root, kind, data) {
     if (i < data.length) {
       bar.style.width = `${((data[i].oi || 0) / maxOI) * 100}%`;
       strike.textContent = data[i].strike;
-    } else {
-      bar.style.width = "0%";
-      strike.textContent = "—";
-    }
+    } else { bar.style.width = "0%"; strike.textContent = "—"; }
   }
 }
 
@@ -222,21 +156,15 @@ function buildWhalesStatic(sym) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
     rows += `<div class="whale-pill" data-whale-row="${sym}-${i}" style="display:none;">
-      <span class="whale-type" data-whale-type="${sym}-${i}">—</span>
-      <span class="whale-sep">·</span>
-      <span class="whale-strike" data-whale-strike="${sym}-${i}">—</span>
-      <span class="whale-sep">·</span>
-      <span class="whale-vol">حجم <b data-whale-vol="${sym}-${i}">—</b></span>
-      <span class="whale-sep">·</span>
-      <span class="whale-oi">مفتوحة <b data-whale-oi="${sym}-${i}">—</b></span>
-      <span class="whale-sep">·</span>
+      <span class="whale-type" data-whale-type="${sym}-${i}">—</span><span class="whale-sep">·</span>
+      <span class="whale-strike" data-whale-strike="${sym}-${i}">—</span><span class="whale-sep">·</span>
+      <span class="whale-vol">حجم <b data-whale-vol="${sym}-${i}">—</b></span><span class="whale-sep">·</span>
+      <span class="whale-oi">مفتوحة <b data-whale-oi="${sym}-${i}">—</b></span><span class="whale-sep">·</span>
       <span class="whale-dir" data-whale-dir="${sym}-${i}">—</span>
     </div>`;
   }
   return `<div class="whales-section" id="whales-${sym}" style="display:none;">
-    <div class="whales-title">🐋 الحيتان المكتشفة</div>
-    <div class="whales-list">${rows}</div>
-  </div>`;
+    <div class="whales-title">🐋 الحيتان المكتشفة</div><div class="whales-list">${rows}</div></div>`;
 }
 function updateWhalesData(root, sym, whales) {
   if (!root) return;
@@ -264,67 +192,95 @@ function updateWhalesData(root, sym, whales) {
       if (vol) vol.textContent = volFmt;
       if (oi)  oi.textContent  = oiFmt;
       if (dir) dir.textContent = w.direction === "buy" ? "🟢 يشتري"
-                              : w.direction === "sell" ? "🔴 يبيع"
-                              : "⚪ محايد";
-    } else {
-      row.style.display = "none";
-    }
+                              : w.direction === "sell" ? "🔴 يبيع" : "⚪ محايد";
+    } else { row.style.display = "none"; }
   }
 }
 
-/* ===== Put/Call Boxes ===== */
 function updatePutCallBoxes(root, sym, card) {
-  const callOI = card.call_oi || [];
-  const putOI  = card.put_oi  || [];
+  const callOI = card.call_oi || [], putOI = card.put_oi || [];
   const tCOI = callOI.reduce((s, x) => s + (x.oi || 0), 0);
   const tPOI = putOI.reduce((s, x) => s + (x.oi || 0), 0);
-  const tCV  = callOI.reduce((s, x) => s + (x.volume || 0), 0);
-  const tPV  = putOI.reduce((s, x) => s + (x.volume || 0), 0);
-  const totOI = tCOI + tPOI;
-  const totV  = tCV + tPV;
+  const tCV = callOI.reduce((s, x) => s + (x.volume || 0), 0);
+  const tPV = putOI.reduce((s, x) => s + (x.volume || 0), 0);
+  const totOI = tCOI + tPOI, totV = tCV + tPV;
   const callOITxt  = totOI > 0 ? Math.round(tCOI / totOI * 100) + "%" : "—";
   const putOITxt   = totOI > 0 ? Math.round(tPOI / totOI * 100) + "%" : "—";
   const callVolTxt = totV  > 0 ? Math.round(tCV  / totV  * 100) + "%" : "—";
   const putVolTxt  = totV  > 0 ? Math.round(tPV  / totV  * 100) + "%" : "—";
   const set = (id, val) => { const el = root.querySelector(`#${id}-${sym}`); if (el) el.textContent = val; };
-  set("pcbox-call-oi",  callOITxt);
-  set("pcbox-put-oi",   putOITxt);
+  set("pcbox-call-oi", callOITxt);
+  set("pcbox-put-oi", putOITxt);
   set("pcbox-call-vol", callVolTxt);
-  set("pcbox-put-vol",  putVolTxt);
+  set("pcbox-put-vol", putVolTxt);
 }
 
-/* ===== TF Box ===== */
+function updateAllDynamic(root, sym, card) {
+  if (!root || !card) return;
+  const callOI = card.call_oi || [], putOI = card.put_oi || [];
+  updateOIBlockData(root, "put-oi",   putOI);
+  updateOIBlockData(root, "put-liq",  putOI.map(x => ({strike: x.strike, oi: x.volume})));
+  updateOIBlockData(root, "call-oi",  callOI);
+  updateOIBlockData(root, "call-liq", callOI.map(x => ({strike: x.strike, oi: x.volume})));
+  updatePutCallBoxes(root, sym, card);
+  updateWhalesData(root, sym, card.whales || []);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+/* ===== TF Box — جديد: مربعات الاستراتيجية ===== */
 function buildTFBox(tf) {
   const label = tf.label || "—";
-  const support = tf.support;
-  const resistance = tf.resistance;
-  const brokeRes = !!tf.broke_resistance;
-  const brokeSup = !!tf.broke_support;
+  const kind = tf.kind || "neutral";
+  const state = tf.state || "inactive";
 
-  let statusHtml = "";
   let boxClass = "tf-cell neutral";
+  let innerHtml = "";
 
-  if (brokeRes) {
-    boxClass = "tf-cell up";
-    statusHtml = `<div class="tf-status tf-broke-up">مخترق ⬆</div>`;
-  } else if (brokeSup) {
-    boxClass = "tf-cell down";
-    statusHtml = `<div class="tf-status tf-broke-down">مكسور ⬇</div>`;
+  if (kind === "reference") {
+    boxClass = "tf-cell neutral";
+    const valTxt = tf.value != null ? `$${Number(tf.value).toFixed(2)}` : "—";
+    innerHtml = `
+      <div class="tf-label"><span>${label}</span></div>
+      <div class="tf-row"><span>${tf.title || ""}</span><span class="v">${valTxt}</span></div>
+      <div class="tf-row"><span class="tf-sub">${tf.sub || ""}</span></div>
+    `;
+  } else if (kind === "breakout") {
+    if (state === "broke_up") boxClass = "tf-cell up";
+    else if (state === "broke_down") boxClass = "tf-cell down";
+    else boxClass = "tf-cell neutral";
+    innerHtml = `
+      <div class="tf-label"><span>${label}</span></div>
+      <div class="tf-state-txt">${tf.text || "—"}</div>
+    `;
+  } else if (kind === "retest") {
+    if (state === "confirmed") boxClass = "tf-cell up";
+    else if (state === "invalidated") boxClass = "tf-cell down";
+    else if (state === "waiting_retest" || state === "retested" || state === "path2_waiting") boxClass = "tf-cell yellow";
+    else boxClass = "tf-cell neutral";
+    innerHtml = `
+      <div class="tf-label"><span>${label}</span></div>
+      <div class="tf-state-txt">${tf.text || "—"}</div>
+    `;
+  } else if (kind === "confirmation") {
+    if (state === "confirmed") boxClass = "tf-cell up";
+    else if (state === "waiting") boxClass = "tf-cell yellow";
+    else boxClass = "tf-cell neutral";
+    innerHtml = `
+      <div class="tf-label"><span>${label}</span></div>
+      <div class="tf-state-txt">${tf.text || "—"}</div>
+    `;
   } else {
-    statusHtml = `<div class="tf-status tf-no">لم يُخترق</div>`;
+    innerHtml = `
+      <div class="tf-label"><span>${label}</span></div>
+      <div class="tf-state-txt">—</div>
+    `;
   }
 
-  const supTxt = support != null ? `$${support.toFixed(2)}` : "—";
-  const resTxt = resistance != null ? `$${resistance.toFixed(2)}` : "—";
-
-  return `
-    <div class="${boxClass}">
-      <div class="tf-label"><span>${label}</span></div>
-      <div class="tf-line"><span class="tf-k">مقاومة</span><span class="tf-v">${resTxt}</span></div>
-      <div class="tf-line"><span class="tf-k">دعم</span><span class="tf-v">${supTxt}</span></div>
-      ${statusHtml}
-    </div>
-  `;
+  return `<div class="${boxClass}">${innerHtml}</div>`;
 }
 
 /* ===== Summary Bar ===== */
@@ -332,30 +288,29 @@ function buildSummaryBar(cardData) {
   const c = cardData.card || {};
   const color = c.color || "gray";
   const label = c.label || "—";
-  const stage = c.stage ? stageLabel(c.stage) : "";
+  const stage = c.stage || "";
+  const stageTxt = stage === "daily_break_weekly" ? "اليومي / الأسبوعي"
+                 : stage === "4h_break_daily"     ? "4H / اليومي" : "";
+  const pattern = cardData.levels?.pattern || "";
   const rr = cardData.levels?.rr ?? "—";
   const rrOk = typeof rr === "number" && rr >= 2.0;
-  const pattern = cardData.levels?.pattern || "";
   const aiText = (cardData.ai_analysis || "").trim();
 
   const aiBlock = aiText ? `
-    <div class="ai-analysis" style="width:100%;text-align:right;direction:rtl;
-         font-size:12.5px;line-height:1.85;color:var(--text);
-         padding:4px 6px 10px;border-bottom:1px dashed rgba(255,255,255,0.12);
-         margin-bottom:8px;white-space:pre-wrap;font-weight:500;">
-      <div style="font-size:10.5px;font-weight:700;color:var(--text-muted);
-                  margin-bottom:4px;">🤖 تحليل ذكي</div>
+    <div style="width:100%;text-align:right;direction:rtl;font-size:12.5px;
+         line-height:1.85;color:var(--text);padding:4px 6px 10px;
+         border-bottom:1px dashed rgba(255,255,255,0.12);margin-bottom:8px;
+         white-space:pre-wrap;font-weight:500;">
+      <div style="font-size:10.5px;font-weight:700;color:var(--text-muted);margin-bottom:4px;">🤖 تحليل ذكي</div>
       ${escapeHtml(aiText)}
     </div>` : "";
 
   return `
-    <div class="summary-bar" style="flex-direction:column;align-items:stretch;
-         border-radius:14px;padding:12px 14px;">
+    <div class="summary-bar" style="flex-direction:column;align-items:stretch;border-radius:14px;padding:12px 14px;">
       ${aiBlock}
-      <div style="display:flex;flex-wrap:wrap;gap:6px 8px;
-                  justify-content:center;align-items:center;">
+      <div style="display:flex;flex-wrap:wrap;gap:6px 8px;justify-content:center;align-items:center;">
         <span class="summary-badge badge-${color}">${label}</span>
-        ${stage ? `<span class="summary-item">${stage}</span><span class="summary-sep">·</span>` : ""}
+        ${stageTxt ? `<span class="summary-item">${stageTxt}</span><span class="summary-sep">·</span>` : ""}
         ${pattern && pattern !== "none" ? `<span class="summary-item">${pattern}</span><span class="summary-sep">·</span>` : ""}
         <span class="summary-item">R:R <b>${rr}</b> ${rrOk ? "✅" : "⚠️"}</span>
       </div>
@@ -366,15 +321,10 @@ function buildSummaryBar(cardData) {
 /* ===== Build Card ===== */
 function buildCard(cardData) {
   const c = cardData.card || {};
-  if (!VALID_COLORS.includes(c.color)) return null;
-  if (DEAD_STATUSES.includes(cardData.monitor_status)) return null;
-
   const lv = cardData.levels || {};
-  const cls = c.color;
+  const cls = c.color || "gray";
   const price = cardData.price ?? 0;
   const sym = cardData.symbol;
-  const monitorStatus = cardData.monitor_status || "none";
-  const ms = monitorStatusLabel(monitorStatus);
 
   checkSound(sym, cls);
 
@@ -382,25 +332,14 @@ function buildCard(cardData) {
   div.className = "card " + cls;
   div.dataset.symbol = sym;
 
-  const monitorBadge = ms.label
-    ? `<span class="monitor-badge ${ms.cls}">${ms.label}</span>`
-    : "";
-
   const row1 = `<div class="card-row row-1">
     <div class="cell symbol-cell">${sym}</div>
-    <div class="cell price-cell">
-      <div class="val" data-price>$${price.toFixed(2)}</div>
-      <div class="sub">السعر الحالي</div>
-    </div>
-    <div class="cell score-cell">
-      <div class="val" data-score>${lv.rr ?? "—"}</div>
-      <div class="sub">R:R</div>
-    </div>
+    <div class="cell price-cell"><div class="val" data-price>$${price.toFixed(2)}</div><div class="sub">السعر الحالي</div></div>
+    <div class="cell score-cell"><div class="val" data-score>${lv.rr ?? "—"}</div><div class="sub">R:R</div></div>
     <div class="cell badge-cell">
       <div class="badge" data-badge>🔥 ${c.label || "—"}</div>
-      ${monitorBadge}
-      <button class="card-trash" data-trash>
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <button class="card-trash">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <polyline points="3 6 5 6 21 6"></polyline>
           <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>
         </svg>
@@ -422,8 +361,9 @@ function buildCard(cardData) {
     <div class="cell"><div class="label">الدخول</div><div class="val">${lv.entry ? "$" + lv.entry : "—"}</div></div>
   </div>`;
 
-  const tfs = cardData.timeframes || [];
-  const tfsHtml = tfs.map(t => buildTFBox(t)).join("");
+  // ✅ مربعات الاستراتيجية (بدل timeframes)
+  const sboxes = cardData.strategy_boxes || [];
+  const tfsHtml = sboxes.map(t => buildTFBox(t)).join("");
 
   const oiHtml = `<div class="oi-grid">
     ${buildOIBlockStatic("مفتوحة - PUT", "put-oi", "#8b5cf6")}
@@ -434,22 +374,10 @@ function buildCard(cardData) {
 
   const boxesHtml = `
     <div class="putcall-boxes">
-      <div class="pcbox pcbox-call">
-        <div class="pcbox-label">مفتوحة - CALL</div>
-        <div class="pcbox-pct" id="pcbox-call-oi-${sym}">—</div>
-      </div>
-      <div class="pcbox pcbox-put">
-        <div class="pcbox-label">مفتوحة - PUT</div>
-        <div class="pcbox-pct" id="pcbox-put-oi-${sym}">—</div>
-      </div>
-      <div class="pcbox pcbox-call">
-        <div class="pcbox-label">حجم - CALL</div>
-        <div class="pcbox-pct" id="pcbox-call-vol-${sym}">—</div>
-      </div>
-      <div class="pcbox pcbox-put">
-        <div class="pcbox-label">حجم - PUT</div>
-        <div class="pcbox-pct" id="pcbox-put-vol-${sym}">—</div>
-      </div>
+      <div class="pcbox pcbox-call"><div class="pcbox-label">مفتوحة - CALL</div><div class="pcbox-pct" id="pcbox-call-oi-${sym}">—</div></div>
+      <div class="pcbox pcbox-put"><div class="pcbox-label">مفتوحة - PUT</div><div class="pcbox-pct" id="pcbox-put-oi-${sym}">—</div></div>
+      <div class="pcbox pcbox-call"><div class="pcbox-label">حجم - CALL</div><div class="pcbox-pct" id="pcbox-call-vol-${sym}">—</div></div>
+      <div class="pcbox pcbox-put"><div class="pcbox-label">حجم - PUT</div><div class="pcbox-pct" id="pcbox-put-vol-${sym}">—</div></div>
     </div>`;
 
   const whalesHtml = buildWhalesStatic(sym);
@@ -466,57 +394,34 @@ function buildCard(cardData) {
   updateAllDynamic(div, sym, cardData);
 
   div.addEventListener("click", (e) => {
-    if (e.target.closest("[data-trash]")) return;
+    if (e.target.closest(".card-trash")) return;
     div.classList.toggle("open");
   });
-
-  div.querySelector("[data-trash]").addEventListener("click", async (e) => {
-    e.stopPropagation();
-    await deleteCard(sym);
+  div.querySelector(".card-trash").addEventListener("click", (e) => {
+    e.stopPropagation(); deleteCard(sym);
   });
 
-  if (!cardData.ai_analysis) {
-    enqueueAIRequest(sym);
-  }
+  if (!cardData.ai_analysis) enqueueAIRequest(sym);
 
   return div;
 }
 
-/* ===== Dynamic Update ===== */
-function updateAllDynamic(root, sym, card) {
-  if (!root || !card) return;
-  const callOI = card.call_oi || [];
-  const putOI  = card.put_oi  || [];
-  updateOIBlockData(root, "put-oi",   putOI);
-  updateOIBlockData(root, "put-liq",  putOI.map(x => ({strike: x.strike, oi: x.volume})));
-  updateOIBlockData(root, "call-oi",  callOI);
-  updateOIBlockData(root, "call-liq", callOI.map(x => ({strike: x.strike, oi: x.volume})));
-  updatePutCallBoxes(root, sym, card);
-  updateWhalesData(root, sym, card.whales || []);
-}
-
-/* ===== Update In Place ===== */
 function updateCardInPlace(cardEl, data) {
   const c = data.card || {};
-  if (!VALID_COLORS.includes(c.color) || DEAD_STATUSES.includes(data.monitor_status)) {
-    cardEl.remove();
-    return;
-  }
   const lv = data.levels || {};
+  const sym = data.symbol;
   const price = data.price ?? 0;
 
   const wasOpen = cardEl.classList.contains("open");
-  const newCls = "card " + c.color + (wasOpen ? " open" : "");
-  if (cardEl.className !== newCls) cardEl.className = newCls;
+  cardEl.className = "card " + (c.color || "gray");
+  if (wasOpen) cardEl.classList.add("open");
 
+  const badge = cardEl.querySelector("[data-badge]");
+  if (badge) badge.textContent = "🔥 " + (c.label || "—");
+  const score = cardEl.querySelector("[data-score]");
+  if (score) score.textContent = lv.rr ?? "—";
   const priceEl = cardEl.querySelector("[data-price]");
   if (priceEl) priceEl.textContent = "$" + price.toFixed(2);
-
-  const scoreEl = cardEl.querySelector("[data-score]");
-  if (scoreEl) scoreEl.textContent = lv.rr ?? "—";
-
-  const badgeEl = cardEl.querySelector("[data-badge]");
-  if (badgeEl) badgeEl.textContent = "🔥 " + (c.label || "—");
 
   const row2 = cardEl.querySelector(".row-2");
   if (row2) {
@@ -526,7 +431,6 @@ function updateCardInPlace(cardEl, data) {
     if (cells[2]) cells[2].textContent = lv.expiry || "—";
     if (cells[3]) cells[3].textContent = lv.strike || "—";
   }
-
   const row3 = cardEl.querySelector(".row-3");
   if (row3) {
     const cells = row3.querySelectorAll(".cell .val");
@@ -538,363 +442,165 @@ function updateCardInPlace(cardEl, data) {
 
   const tfGrid = cardEl.querySelector(".tf-grid");
   if (tfGrid) {
-    const tfs = data.timeframes || [];
-    tfGrid.innerHTML = tfs.map(t => buildTFBox(t)).join("");
+    const sboxes = data.strategy_boxes || [];
+    tfGrid.innerHTML = sboxes.map(t => buildTFBox(t)).join("");
   }
-
-  updateAllDynamic(cardEl, data.symbol, data);
-
+  updateAllDynamic(cardEl, sym, data);
   const sumWrap = cardEl.querySelector("[data-summary-wrap]");
   if (sumWrap) sumWrap.innerHTML = buildSummaryBar(data);
 }
 
-/* ===== Delete Card (يدوي) ===== */
-async function deleteCard(symbol) {
-  scanCards = scanCards.filter(c => c.symbol !== symbol);
-  deletedSymbols.add(symbol);
-  saveDeleted();
-  saveCards();
-
-  try {
-    await fetch(`${API_BASE}/api/monitor/${symbol}/remove`, { method: "POST" });
-  } catch (e) {}
-
-  if (monitorTimers.has(symbol)) {
-    clearInterval(monitorTimers.get(symbol));
-    monitorTimers.delete(symbol);
-  }
-
+function rebuildCard(symbol, newData) {
+  const idx = cards.findIndex(c => c.symbol === symbol);
+  if (idx === -1) return;
+  const old = cards[idx];
+  const merged = { ...newData };
+  if (!newData.call_oi || newData.call_oi.length === 0) merged.call_oi = old.call_oi || [];
+  if (!newData.put_oi || newData.put_oi.length === 0)   merged.put_oi = old.put_oi || [];
+  if (!newData.whales || newData.whales.length === 0)   merged.whales = old.whales || [];
+  if (!newData.ai_analysis && old.ai_analysis)          merged.ai_analysis = old.ai_analysis;
+  cards[idx] = merged;
   const el = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
-  if (el) el.remove();
-  if (scanCards.length === 0) emptyState.style.display = "block";
+  if (!el) return;
+  updateCardInPlace(el, merged);
+  saveCards();
 }
 
-/* ===== Auto Remove ===== */
-function removeCardAuto(symbol) {
-  const before = scanCards.length;
-  scanCards = scanCards.filter(c => c.symbol !== symbol);
-  if (before === scanCards.length) return;
-
-  saveCards();
-
-  if (monitorTimers.has(symbol)) {
-    clearInterval(monitorTimers.get(symbol));
-    monitorTimers.delete(symbol);
-  }
-
-  const el = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
-  if (el) el.remove();
-  if (scanCards.length === 0) emptyState.style.display = "block";
-}
-
-/* ===== Render ===== */
 function renderCards() {
-  const filtered = scanCards
-    .filter(c => !deletedSymbols.has(c.symbol))
-    .filter(c => VALID_COLORS.includes(c.card?.color))
-    .filter(c => !DEAD_STATUSES.includes(c.monitor_status))
-    .sort((a, b) => (b.levels?.rr ?? 0) - (a.levels?.rr ?? 0));
-
-  Array.from(cardsArea.children).forEach(el => {
-    if (el.classList && el.classList.contains("card")) {
-      const sym = el.dataset.symbol;
-      if (!filtered.find(c => c.symbol === sym)) el.remove();
-    }
+  cardsArea.innerHTML = "";
+  emptyState.style.display = cards.length ? "none" : "block";
+  const order = { green: 0, red: 0, yellow: 1, gray: 2 };
+  const sorted = [...cards].sort((a, b) => {
+    const oa = order[a.card?.color] ?? 3;
+    const ob = order[b.card?.color] ?? 3;
+    if (oa !== ob) return oa - ob;
+    return (b.levels?.rr ?? 0) - (a.levels?.rr ?? 0);
   });
-
-  filtered.forEach((cardData, idx) => {
-    const sym = cardData.symbol;
-    let el = cardsArea.querySelector(`[data-symbol="${sym}"]`);
-
-    if (el) {
-      updateCardInPlace(el, cardData);
-    } else {
-      el = buildCard(cardData);
-      if (!el) return;
-    }
-
-    const current = Array.from(cardsArea.children).filter(c => c.classList && c.classList.contains("card"));
-    if (current[idx] !== el) {
-      if (idx >= current.length) cardsArea.appendChild(el);
-      else cardsArea.insertBefore(el, current[idx]);
-    }
-  });
-
-  emptyState.style.display = filtered.length ? "none" : "block";
-  if (filtered.length === 0 && scanCards.length > 0) {
-    emptyState.innerHTML = "<p>لا توجد فرص حالياً</p>";
-  } else if (scanCards.length === 0) {
-    emptyState.innerHTML = "<p>اضغط \"ابدأ المسح\" لفحص السوق</p>";
-  }
-
-  filtered.forEach(cardData => {
-    if (!cardData.ai_analysis) enqueueAIRequest(cardData.symbol);
-  });
+  sorted.forEach(c => cardsArea.appendChild(buildCard(c)));
 }
 
-/* ===== Scan ===== */
-async function startScan() {
-  scanBtn.disabled = true;
-  scanBtn.querySelector(".scan-btn-text").textContent = "جاري المسح...";
-
-  // ✅ تنظيف الحذف القديم
-  deletedSymbols.clear();
-  saveDeleted();
-  pollFailures = 0;
-
-  progressWrap.style.display = "block";
-  progressFill.style.width = "0%";
-  progressText.textContent = "0 / 500";
-  progressFound.textContent = "0 فرص";
-
+async function searchSymbol(symbol) {
+  symbol = symbol.toUpperCase().trim();
+  if (!symbol) return;
+  const ex = cards.find(c => c.symbol === symbol);
+  if (ex) {
+    const el = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
+    if (el) el.classList.add("open");
+    return;
+  }
   try {
-    const r = await fetch(`${API_BASE}/api/scan/start`, { method: "POST" });
+    const r = await fetch(`${API_BASE}/api/analyze/${symbol}`);
     const d = await r.json();
-
-    if (!d.scan_id) {
-      alert("فشل بدء المسح");
-      resetScanButton();
-      return;
+    if (!r.ok) {
+      alert(`خطأ ${r.status}:\n${d.error || "غير معروف"}`);
+      setConnection(false); return;
     }
-
-    currentScan = { scan_id: d.scan_id, total: d.total };
-    totalSymbols.textContent = d.total;
-
-    scanTimer = setInterval(pollScanProgress, 2000);
-    pollScanProgress();
-
+    setConnection(true);
+    cards.push(d);
+    saveCards();
+    renderCards();
+    connectLive(symbol);
+    startStatePolling(symbol);
   } catch (e) {
-    alert("خطأ: " + e.message);
-    resetScanButton();
+    setConnection(false);
+    alert("تعذّر الاتصال:\n" + e.message);
   }
 }
 
-function resetScanButton() {
-  scanBtn.disabled = false;
-  scanBtn.querySelector(".scan-btn-text").textContent = "ابدأ المسح";
+function deleteCard(symbol) {
+  cards = cards.filter(c => c.symbol !== symbol);
+  saveCards(); renderCards();
+  if (socketMap.has(symbol)) { try { socketMap.get(symbol).close(); } catch (e) {} socketMap.delete(symbol); }
+  if (reconnectTimers.has(symbol)) { clearTimeout(reconnectTimers.get(symbol)); reconnectTimers.delete(symbol); }
+  if (stateTimers.has(symbol)) { clearInterval(stateTimers.get(symbol)); stateTimers.delete(symbol); }
+  fetch(`${API_BASE}/api/remove/${symbol}`).catch(() => {});
 }
 
-function mergeScanResults(newResults) {
-  const existingMap = new Map(scanCards.map(c => [c.symbol, c]));
-
-  newResults.forEach(newCard => {
-    const sym = newCard.symbol;
-    if (deletedSymbols.has(sym)) return;
-    if (!VALID_COLORS.includes(newCard.card?.color)) return;
-    if (DEAD_STATUSES.includes(newCard.monitor_status)) {
-      removeCardAuto(sym);
-      return;
-    }
-
-    const existing = existingMap.get(sym);
-    if (existing) {
-      const aiText = existing.ai_analysis;
-      Object.assign(existing, newCard);
-      if (!existing.ai_analysis && aiText) existing.ai_analysis = aiText;
-    } else {
-      scanCards.push(newCard);
-    }
-  });
-
-  saveCards();
-  renderCards();
+function updateCardPrice(symbol, price) {
+  const card = cards.find(c => c.symbol === symbol);
+  if (!card) return;
+  if (price && price > 0 && price !== card.price) {
+    card.price = price;
+    const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
+    if (!cardEl) return;
+    const priceEl = cardEl.querySelector("[data-price]");
+    if (priceEl) priceEl.textContent = "$" + parseFloat(price).toFixed(2);
+  }
 }
 
-/* ===== ✅ معالجة 404 + فشل الشبكة ===== */
-async function pollScanProgress() {
-  if (!currentScan) return;
-
-  let r;
+async function fetchState(symbol) {
   try {
-    r = await fetch(`${API_BASE}/api/scan/${currentScan.scan_id}`);
-  } catch (e) {
-    // خطأ شبكة — أعِد المحاولة
-    pollFailures++;
-    if (pollFailures >= MAX_POLL_FAILURES) {
-      handleScanLost("⚠️ خطأ في الاتصال بالسيرفر. الرجاء إعادة المحاولة.");
-    }
-    return;
-  }
-
-  // ✅ 404 = المسح فُقد (إعادة تشغيل السيرفر)
-  if (r.status === 404) {
-    handleScanLost("⚠️ فقد الاتصال بالمسح (السيرفر أُعيد تشغيله). الرجاء إعادة المسح.");
-    return;
-  }
-
-  if (!r.ok) {
-    pollFailures++;
-    if (pollFailures >= MAX_POLL_FAILURES) {
-      handleScanLost("⚠️ فشل الاتصال بالمسح. الرجاء إعادة المحاولة.");
-    }
-    return;
-  }
-
-  // نجح — نصفّر العدّاد
-  pollFailures = 0;
-
-  try {
+    const r = await fetch(`${API_BASE}/api/analyze/${symbol}`);
+    if (!r.ok) return;
     const d = await r.json();
-
-    const pct = (d.completed / d.total) * 100;
-    progressFill.style.width = pct + "%";
-    progressText.textContent = `${d.completed} / ${d.total}`;
-    progressFound.textContent = `${d.found} فرص`;
-
-    mergeScanResults(d.results || []);
-
-    if (d.status === "done" || d.status === "cancelled") {
-      clearInterval(scanTimer);
-      scanTimer = null;
-      currentScan = null;
-      resetScanButton();
-      progressWrap.style.display = d.status === "done" ? "none" : "block";
-      startMonitoring();
-    }
-  } catch (e) {
-    pollFailures++;
-    if (pollFailures >= MAX_POLL_FAILURES) {
-      handleScanLost("⚠️ فشل قراءة بيانات المسح. الرجاء إعادة المحاولة.");
-    }
-  }
-}
-
-/* ===== ✅ معالجة فقدان المسح ===== */
-function handleScanLost(message) {
-  clearInterval(scanTimer);
-  scanTimer = null;
-  currentScan = null;
-  resetScanButton();
-  progressWrap.style.display = "none";
-  progressFill.style.width = "0%";
-
-  // إذا لا توجد بطاقات → أظهر الرسالة
-  const hasCards = scanCards.filter(c =>
-    VALID_COLORS.includes(c.card?.color) &&
-    !DEAD_STATUSES.includes(c.monitor_status)
-  ).length > 0;
-
-  if (!hasCards) {
-    emptyState.style.display = "block";
-    emptyState.innerHTML = `<p>${escapeHtml(message)}</p>`;
-  } else {
-    alert(message);
-  }
-}
-
-scanBtn.addEventListener("click", startScan);
-
-scanCancelBtn.addEventListener("click", async () => {
-  if (!currentScan) return;
-  try {
-    await fetch(`${API_BASE}/api/scan/${currentScan.scan_id}/cancel`, { method: "POST" });
-  } catch (e) {}
-});
-
-/* ===== Monitoring ===== */
-function startMonitoring() {
-  monitorTimers.forEach(t => clearInterval(t));
-  monitorTimers.clear();
-
-  scanCards.forEach(card => {
-    const sym = card.symbol;
-    if (deletedSymbols.has(sym)) return;
-    if (!VALID_COLORS.includes(card.card?.color)) return;
-    if (DEAD_STATUSES.includes(card.monitor_status)) return;
-    fetchMonitorStatus(sym);
-    const timer = setInterval(() => fetchMonitorStatus(sym), 30000);
-    monitorTimers.set(sym, timer);
-  });
-
-  startPricePolling();
-}
-
-async function fetchMonitorStatus(symbol) {
-  if (deletedSymbols.has(symbol)) return;
-  try {
-    const mRes = await fetch(`${API_BASE}/api/monitor/${symbol}`);
-    if (mRes.ok) {
-      const m = await mRes.json();
-      if (m.monitored) {
-        if (DEAD_STATUSES.includes(m.status)) {
-          removeCardAuto(symbol);
-          return;
-        }
-        updateCardMonitorStatus(symbol, m);
-      }
-    }
+    rebuildCard(symbol, d);
   } catch (e) {}
 }
 
-function updateCardMonitorStatus(symbol, m) {
-  const card = scanCards.find(c => c.symbol === symbol);
-  if (card) card.monitor_status = m.status;
-
-  const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
-  if (!cardEl) return;
-  const badgeCell = cardEl.querySelector(".badge-cell");
-  if (!badgeCell) return;
-
-  const old = badgeCell.querySelector(".monitor-badge");
-  if (old) old.remove();
-
-  const ms = monitorStatusLabel(m.status);
-  if (ms.label) {
-    const span = document.createElement("span");
-    span.className = "monitor-badge " + ms.cls;
-    span.textContent = ms.label;
-    badgeCell.insertBefore(span, badgeCell.querySelector("[data-trash]"));
-  }
+function startStatePolling(symbol) {
+  if (stateTimers.has(symbol)) clearInterval(stateTimers.get(symbol));
+  const timer = setInterval(() => fetchState(symbol), 60000);
+  stateTimers.set(symbol, timer);
 }
 
-/* ===== Price Polling ===== */
+function connectLive(symbol) {
+  if (socketMap.has(symbol)) { try { socketMap.get(symbol).close(); } catch (e) {} }
+  const proto = window.location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${window.location.host}/ws/${symbol}`);
+  ws.onopen = () => {
+    setConnection(true);
+    ws._ping = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) { try { ws.send("ping"); } catch (e) {} }
+    }, 30000);
+  };
+  ws.onclose = () => {
+    if (ws._ping) clearInterval(ws._ping);
+    socketMap.delete(symbol);
+    if (cards.find(c => c.symbol === symbol)) {
+      const timer = setTimeout(() => connectLive(symbol), 5000);
+      reconnectTimers.set(symbol, timer);
+    }
+  };
+  ws.onmessage = (ev) => {
+    try {
+      const m = JSON.parse(ev.data);
+      updateCardPrice(m.symbol, m.price);
+    } catch (e) {}
+  };
+  socketMap.set(symbol, ws);
+}
+
 async function pollPrices() {
-  for (const card of scanCards) {
-    if (deletedSymbols.has(card.symbol)) continue;
-    if (!VALID_COLORS.includes(card.card?.color)) continue;
-    if (DEAD_STATUSES.includes(card.monitor_status)) continue;
+  for (const card of cards) {
     try {
       const r = await fetch(`${API_BASE}/api/price/${card.symbol}`);
       if (!r.ok) continue;
       const d = await r.json();
-      if (d.price) {
-        card.price = d.price;
-        const el = cardsArea.querySelector(`[data-symbol="${card.symbol}"]`);
-        if (el) {
-          const priceEl = el.querySelector("[data-price]");
-          if (priceEl) priceEl.textContent = "$" + parseFloat(d.price).toFixed(2);
-        }
-      }
+      if (d.price) updateCardPrice(card.symbol, d.price);
     } catch (e) {}
   }
 }
 
-function startPricePolling() {
-  if (pricePollTimer) return;
-  setTimeout(pollPrices, 1000);
-  pricePollTimer = setInterval(pollPrices, 5000);
-}
+searchForm.addEventListener("submit", (e) => {
+  e.preventDefault();
+  searchSymbol(symbolInput.value);
+  symbolInput.value = "";
+  symbolInput.blur();
+});
 
-/* ===== Init ===== */
 (function init() {
-  scanCards = loadCards();
-  loadDeleted();
-  scanCards = scanCards
-    .filter(c => !deletedSymbols.has(c.symbol))
-    .filter(c => VALID_COLORS.includes(c.card?.color))
-    .filter(c => !DEAD_STATUSES.includes(c.monitor_status));
-  saveCards();
+  cards = loadCards();
   renderCards();
-
-  if (scanCards.length > 0) {
-    startMonitoring();
-  }
-
-  fetch(`${API_BASE}/api/symbols`)
-    .then(r => r.json())
-    .then(d => { totalSymbols.textContent = d.total; })
-    .catch(() => {});
-
+  cards.forEach(c => {
+    connectLive(c.symbol);
+    startStatePolling(c.symbol);
+    if (!c.ai_analysis) enqueueAIRequest(c.symbol);
+  });
+  setTimeout(() => {
+    cards.forEach(c => fetchState(c.symbol));
+  }, 2000);
   checkBackendStatus();
   setInterval(checkBackendStatus, 60000);
+  setTimeout(pollPrices, 3000);
+  pollTimer = setInterval(pollPrices, 5000);
 })();
