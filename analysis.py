@@ -3,11 +3,10 @@ analysis.py — استراتيجية الاختراق وإعادة الاختب�
 مساران: اختراق يومي/أسبوعي، أو اختراق 4H/يومي.
 
 ⚠️ عقد البيانات:
-- المستدعي (main.py) يجب أن يُنشئ عمودين:
-    * time       = وقت بداية الشمعة (من مزود البيانات، للعرض فقط).
-    * close_time = وقت إغلاق الشمعة (لحظة توفر المعلومة) بتوقيت UTC.
-- المنطق يستخدم close_time حصراً — لا fallback على time.
-- المستدعي يجب أن يمرر شموعاً مكتملة فقط (main.py يستبعد غير المكتملة).
+- المستدعي (market_time.py) ينشئ time وclose_time وفق تقويم جلسات NYSE الفعلي.
+- المنطق يستخدم close_time حصراً؛ ولا يُفترض أن إغلاق اليومي = timestamp + 24h
+  أو إغلاق الأسبوعي = timestamp + 7 أيام.
+- المستدعي يمرر الشموع المكتملة فقط، بما في ذلك الشموع الأسبوعية التي تكتمل بعد إغلاق الجمعة.
 
 ⚠️ تحديد المستويات (إصلاح جوهري):
 - "قمة/قاع الأسبوع السابق": تُحدد زمنياً — آخر شمعة أسبوعية مُكتملة
@@ -37,7 +36,6 @@ TOLERANCE_ATR_MULT = 0.25
 BREAKOUT_LOOKBACK = 10
 RVOL_PERIOD = 20
 
-# السوق الأمريكي — توقيت نيويورك
 MARKET_TZ = "America/New_York"
 
 _REQUIRED_COLUMNS = {"open", "high", "low", "close", "volume"}
@@ -59,11 +57,16 @@ def _valid_df(df: Optional[pd.DataFrame]) -> bool:
 
 
 def _sorted_df(df: pd.DataFrame) -> pd.DataFrame:
-    """نسخة مرتبة زمنياً بفهرس رقمي متسلسل، تعتمد على close_time."""
+    """تنظيف OHLCV وترتيبه زمنياً بفهرس رقمي متسلسل."""
     out = df.copy()
     out["time"] = pd.to_datetime(out["time"], errors="coerce", utc=True)
     out["close_time"] = pd.to_datetime(out["close_time"], errors="coerce", utc=True)
-    out = out.dropna(subset=["time", "close_time"])
+    for col in ("open", "high", "low", "close", "volume"):
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    out = out.dropna(subset=["time", "close_time", "open", "high", "low", "close", "volume"])
+    out = out[(out[["open", "high", "low", "close"]] > 0).all(axis=1) & (out["volume"] >= 0)]
+    out = out[(out["high"] >= out[["open", "close", "low"]].max(axis=1)) &
+              (out["low"] <= out[["open", "close", "high"]].min(axis=1))]
     out = out.sort_values("close_time", kind="stable")
     out = out.drop_duplicates(subset=["close_time"], keep="last")
     return out.reset_index(drop=True)
@@ -130,28 +133,6 @@ def _is_bearish(row) -> bool:
     return float(row["close"]) < float(row["open"])
 
 
-def _extreme_until(df, since_time, until_time, direction, include_since=True):
-    """
-    يحسب أقصى high/أدنى low ضمن نافذة زمنية [since_time, until_time].
-    يعتمد على close_time. لا يقرأ صفوفاً بعد until_time.
-    """
-    if not _valid_df(df) or since_time is None or until_time is None:
-        return None
-    start = pd.to_datetime(since_time, errors="coerce", utc=True)
-    end = pd.to_datetime(until_time, errors="coerce", utc=True)
-    if pd.isna(start) or pd.isna(end) or end < start:
-        return None
-    if include_since:
-        mask = (df["close_time"] >= start) & (df["close_time"] <= end)
-    else:
-        mask = (df["close_time"] > start) & (df["close_time"] <= end)
-    sub = df.loc[mask]
-    if sub.empty:
-        return None
-    col = "high" if direction == "up" else "low"
-    return float(sub[col].max() if direction == "up" else sub[col].min())
-
-
 def compute_tolerance(level: float, atr_val: float) -> float:
     if not np.isfinite(level) or not np.isfinite(atr_val) or atr_val <= 0:
         return 0.0
@@ -159,39 +140,29 @@ def compute_tolerance(level: float, atr_val: float) -> float:
 
 
 # ============================================================
-# تحديد المستويات زمنياً (إصلاح جوهري)
+# تحديد المستويات زمنياً
 # ============================================================
 def _now_market() -> pd.Timestamp:
     """الوقت الحالي بتوقيت نيويورك (سوق الأسهم الأمريكي)."""
     return pd.Timestamp.now(tz=MARKET_TZ)
 
 
+def _completed_rows_as_of(df: pd.DataFrame, now_ny: Optional[pd.Timestamp]) -> pd.DataFrame:
+    """يرجع الشموع المكتملة حتى اللحظة المرجعية، مرتبة حسب close_time."""
+    if df is None or df.empty or "close_time" not in df.columns:
+        return pd.DataFrame()
+    data = _sorted_df(df)
+    now = _now_market() if now_ny is None else pd.Timestamp(now_ny)
+    if now.tzinfo is None:
+        now = now.tz_localize(MARKET_TZ)
+    now_utc = now.tz_convert("UTC")
+    return data[data["close_time"] <= now_utc]
+
+
 def get_prev_week_levels(df_weekly: pd.DataFrame,
                          now_ny: Optional[pd.Timestamp] = None):
-    """
-    (high, low) لآخر شمعة أسبوعية مُكتملة في الأسبوع التقويمي السابق.
-    - start_of_this_week = الاثنين 00:00 (توقيت نيويورك) للأسبوع الحالي.
-    - نختار آخر شمعة close_time < start_of_this_week.
-    - هذا يعمل بثبات بغض النظر عن يوم الأسبوع.
-    """
-    if df_weekly is None or len(df_weekly) == 0 or "close_time" not in df_weekly.columns:
-        return None, None
-    if now_ny is None:
-        now_ny = _now_market()
-    try:
-        days_since_mon = int(now_ny.weekday())  # Monday=0
-        start_ny = (now_ny - pd.Timedelta(days=days_since_mon)).normalize()
-        start_utc = start_ny.tz_convert("UTC")
-    except Exception:
-        return None, None
-
-    try:
-        mask = df_weekly["close_time"] < start_utc
-    except TypeError:
-        # Fallback لو close_time غير aware
-        mask = df_weekly["close_time"] < start_utc.tz_localize(None)
-
-    sub = df_weekly[mask]
+    """قمة/قاع آخر أسبوع مكتمل؛ في السبت/الأحد يشمل أسبوع التداول المنتهي للتو."""
+    sub = _completed_rows_as_of(df_weekly, now_ny)
     if sub.empty:
         return None, None
     row = sub.iloc[-1]
@@ -200,66 +171,91 @@ def get_prev_week_levels(df_weekly: pd.DataFrame,
 
 def get_prev_day_levels(df_daily: pd.DataFrame,
                         now_ny: Optional[pd.Timestamp] = None):
-    """
-    (high, low) لآخر شمعة يومية مُكتملة قبل بداية اليوم الحالي (نيويورك).
-    - يعادل "أمس" بمعنى آخر جلسة تداول منتهية.
-    """
-    if df_daily is None or len(df_daily) == 0 or "close_time" not in df_daily.columns:
-        return None, None
-    if now_ny is None:
-        now_ny = _now_market()
-    try:
-        start_ny = now_ny.normalize()   # 00:00 توقيت نيويورك اليوم
-        start_utc = start_ny.tz_convert("UTC")
-    except Exception:
-        return None, None
+    """قمة/قاع آخر جلسة مكتملة قبل بداية اليوم الحالي بتوقيت نيويورك.
 
-    try:
-        mask = df_daily["close_time"] < start_utc
-    except TypeError:
-        mask = df_daily["close_time"] < start_utc.tz_localize(None)
-
-    sub = df_daily[mask]
+    لا تتحول مستويات «أمس» إلى مستويات اليوم بعد إغلاق السوق؛ لذلك نستخدم
+    منتصف الليل المحلي حدّاً زمنياً ونستبعد أي شمعة أغلقت في اليوم الحالي.
+    في عطلة نهاية الأسبوع تبقى آخر جلسة فعلية (عادةً الجمعة) هي المرجع.
+    """
+    sub = _completed_rows_as_of(df_daily, now_ny)
+    if sub.empty:
+        return None, None
+    now = _now_market() if now_ny is None else pd.Timestamp(now_ny)
+    if now.tzinfo is None:
+        now = now.tz_localize(MARKET_TZ)
+    day_start_utc = now.normalize().tz_convert("UTC")
+    sub = sub[sub["close_time"] < day_start_utc]
     if sub.empty:
         return None, None
     row = sub.iloc[-1]
     return float(row["high"]), float(row["low"])
 
 
-# ============================================================
-# 1. فحص الاختراق
-# ============================================================
-def check_breakout(df, level, direction, lookback=BREAKOUT_LOOKBACK):
-    """
-    يبحث عن أحدث اختراق مؤكد بالحجم (RVOL ≥ 1.5).
-    عند العثور على الأحدث، لا يعود للبحث عن اختراق أقدم.
-    """
-    if not _valid_df(df) or len(df) < max(25, RVOL_PERIOD + 1) or level is None:
-        return {"broken": False, "reason": "insufficient_data"}
+def _reference_levels_before(reference_df: pd.DataFrame, timestamp):
+    """قمة/قاع آخر شمعة مرجعية أُغلقت قبل timestamp حصراً."""
+    if not _valid_df(reference_df) or timestamp is None:
+        return None, None
+    ts = pd.to_datetime(timestamp, errors="coerce", utc=True)
+    if pd.isna(ts):
+        return None, None
+    ref = _sorted_df(reference_df)
+    prior = ref[ref["close_time"] < ts]
+    if prior.empty:
+        return None, None
+    row = prior.iloc[-1]
+    return float(row["high"]), float(row["low"])
 
+
+# ============================================================
+# 1. فحص الاختراق الديناميكي
+# ============================================================
+def check_breakout_dynamic(df, reference_df, direction,
+                           lookback=BREAKOUT_LOOKBACK):
+    """يفحص الاختراق بمستوى الفترة السابقة لكل شمعة حسب توقيتها."""
+    if not _valid_df(df) or not _valid_df(reference_df):
+        return {"broken": False, "reason": "no_data"}
     data = _sorted_df(df)
+    refs = _sorted_df(reference_df)
+    if len(data) < RVOL_PERIOD + 2:
+        return {"broken": False, "reason": "insufficient_data"}
     rv_series = rvol_series(data, RVOL_PERIOD)
-    start = max(0, len(data) - int(lookback))
-
+    start = max(1, len(data) - max(1, int(lookback)))
+    crossing = None
     for i in range(len(data) - 1, start - 1, -1):
-        rv = rv_series.iloc[i]
-        if pd.isna(rv) or float(rv) < MIN_RVOL:
+        level_high, level_low = _reference_levels_before(refs, data.iloc[i]["close_time"])
+        level = level_high if direction == "up" else level_low
+        if level is None:
             continue
-        row = data.iloc[i]
-        close = float(row["close"])
-        if direction == "up" and close > float(level):
-            return {
-                "broken": True, "type": "up", "level": float(level),
-                "break_index": i, "break_time": _time_of(data, i),
-                "break_close": close, "rvol": round(float(rv), 2),
-            }
-        if direction == "down" and close < float(level):
-            return {
-                "broken": True, "type": "down", "level": float(level),
-                "break_index": i, "break_time": _time_of(data, i),
-                "break_close": close, "rvol": round(float(rv), 2),
-            }
-    return {"broken": False, "reason": "no_qualifying_breakout"}
+        prev_close = float(data.iloc[i - 1]["close"])
+        close = float(data.iloc[i]["close"])
+        crossed = (prev_close <= level and close > level) if direction == "up" else (prev_close >= level and close < level)
+        if crossed:
+            crossing = (i, float(level))
+            break
+    if crossing is None:
+        return {"broken": False, "reason": "no_fresh_crossing"}
+    crossing_idx, level = crossing
+    row = data.iloc[crossing_idx]
+    rv = rv_series.iloc[crossing_idx]
+    body = _body_ratio(row)
+    if pd.isna(rv) or float(rv) < MIN_RVOL:
+        return {"broken": False, "reason": "latest_crossing_rvol_below_min",
+                "break_index": crossing_idx, "level": level,
+                "rvol": None if pd.isna(rv) else float(rv)}
+    if body < BODY_RATIO_MIN:
+        return {"broken": False, "reason": "breakout_body_below_min",
+                "break_index": crossing_idx, "level": level,
+                "body_ratio": round(body, 3)}
+    if direction == "up" and not _is_bullish(row):
+        return {"broken": False, "reason": "breakout_candle_not_bullish",
+                "break_index": crossing_idx, "level": level}
+    if direction == "down" and not _is_bearish(row):
+        return {"broken": False, "reason": "breakout_candle_not_bearish",
+                "break_index": crossing_idx, "level": level}
+    return {"broken": True, "type": direction, "level": level,
+            "break_index": crossing_idx, "break_time": _time_of(data, crossing_idx),
+            "break_close": float(row["close"]), "rvol": round(float(rv), 2),
+            "body_ratio": round(body, 2)}
 
 
 # ============================================================
@@ -271,13 +267,7 @@ def find_retest(df, level, direction, break_time=None, atr_val=None,
         return {"retested": False, "status": "no_data"}
 
     data = _sorted_df(df)
-    if atr_val is None or not np.isfinite(atr_val) or atr_val <= 0:
-        atr_values = atr(data, ATR_PERIOD)
-        atr_val = float(atr_values.iloc[-1]) if len(atr_values) and pd.notna(atr_values.iloc[-1]) else np.nan
-    if not np.isfinite(atr_val) or atr_val <= 0:
-        return {"retested": False, "status": "invalid_atr"}
-
-    tol = compute_tolerance(float(level), float(atr_val))
+    atr_values = atr(data, ATR_PERIOD)
     if break_time is not None:
         after = _positions_after(data, break_time, strict=True)
     else:
@@ -286,35 +276,40 @@ def find_retest(df, level, direction, break_time=None, atr_val=None,
         return {"retested": False, "status": "no_candles_after"}
 
     positions = after[:int(max_candles)]
-    for i in positions:
+    for offset, i in enumerate(positions, start=1):
         row = data.iloc[i]
         high, low, close = float(row["high"]), float(row["low"]), float(row["close"])
-
-        # الإبطال يسري منذ أول شمعة بعد الاختراق وحتى Retest
-        if direction == "up" and close < level:
+        # الإبطال يبدأ من أول شمعة مكتملة بعد الاختراق؛ الذيل وحده لا يبطل.
+        if direction == "up" and close < float(level):
             return {"retested": False, "status": "invalidated_before_retest",
                     "violation_idx": i, "violation_time": _time_of(data, i)}
-        if direction == "down" and close > level:
+        if direction == "down" and close > float(level):
             return {"retested": False, "status": "invalidated_before_retest",
                     "violation_idx": i, "violation_time": _time_of(data, i)}
 
-        if direction == "up" and low <= float(level) + tol and close > level:
+        av = atr_val
+        if av is None or not np.isfinite(av) or av <= 0:
+            av = float(atr_values.iloc[i]) if len(atr_values) > i and pd.notna(atr_values.iloc[i]) else np.nan
+        if not np.isfinite(av) or av <= 0:
+            continue
+        tol = compute_tolerance(float(level), float(av))
+        if direction == "up" and float(level) - tol <= low <= float(level) + tol and close > float(level):
             return {
                 "retested": True, "status": "ok", "type": "up", "level": float(level),
                 "retest_idx": i, "retest_time": _time_of(data, i),
                 "retest_high": high, "retest_low": low,
                 "retest_open": float(row["open"]), "retest_close": close,
-                "tolerance": round(tol, 6),
-                "candles_since_break": positions.index(i) + 1,
+                "atr_at_retest": float(av), "tolerance": round(tol, 6),
+                "candles_since_break": offset,
             }
-        if direction == "down" and high >= float(level) - tol and close < level:
+        if direction == "down" and float(level) - tol <= high <= float(level) + tol and close < float(level):
             return {
                 "retested": True, "status": "ok", "type": "down", "level": float(level),
                 "retest_idx": i, "retest_time": _time_of(data, i),
                 "retest_high": high, "retest_low": low,
                 "retest_open": float(row["open"]), "retest_close": close,
-                "tolerance": round(tol, 6),
-                "candles_since_break": positions.index(i) + 1,
+                "atr_at_retest": float(av), "tolerance": round(tol, 6),
+                "candles_since_break": offset,
             }
 
     return {"retested": False, "status": "no_retest_in_window"}
@@ -349,59 +344,53 @@ def check_stability(df, level, direction, from_idx, until_idx=None):
 def find_second_candle(df, level, direction, retest_idx,
                        max_window=MAX_SECOND_CANDLE_WINDOW,
                        max_first_window=MAX_FIRST_CANDLE_WINDOW):
-    """
-    شمعة Retest ليست تأكيداً.
-    الشمعة الأولى: أول إغلاق في اتجاه الصفقة خلال max_first_window شموع بعد Retest.
-    الشمعة الثانية: أول إغلاق في الاتجاه بعد الأولى، خلال max_window شموع بعدها.
-    إذا أُغلقت أي شمعة ضد المستوى في فترة الانتظار، تُلغى الإشارة.
-    """
-    if not _valid_df(df) or retest_idx < 0 or retest_idx >= len(df):
+    """لا تحتسب شمعة Retest؛ أول تأكيد قوي ثم الشمعة المكتملة التالية مباشرة."""
+    data = _sorted_df(df) if _valid_df(df) else pd.DataFrame()
+    if data.empty or retest_idx < 0 or retest_idx >= len(data):
         return {"found": False, "reason": "invalid_retest_index"}
 
-    data = _sorted_df(df)
     retest_idx = int(retest_idx)
     first_end = min(len(data) - 1, retest_idx + int(max_first_window))
     first_idx = None
-
     for i in range(retest_idx + 1, first_end + 1):
-        close = float(data.iloc[i]["close"])
+        row = data.iloc[i]
+        close = float(row["close"])
         if direction == "up" and close < level:
             return {"found": False, "reason": "invalidated_before_first", "violation_idx": i}
         if direction == "down" and close > level:
             return {"found": False, "reason": "invalidated_before_first", "violation_idx": i}
-        if (direction == "up" and close > level) or (direction == "down" and close < level):
+        directional = (_is_bullish(row) and close > level) if direction == "up" else (_is_bearish(row) and close < level)
+        if directional and _body_ratio(row) >= BODY_RATIO_MIN:
             first_idx = i
             break
-
     if first_idx is None:
         return {"found": False, "reason": "no_first_in_window"}
 
-    second_end = min(len(data) - 1, first_idx + int(max_window))
-    for j in range(first_idx + 1, second_end + 1):
-        row = data.iloc[j]
-        close = float(row["close"])
-        if direction == "up" and close < level:
-            return {"found": False, "reason": "invalidated_in_window", "violation_idx": j}
-        if direction == "down" and close > level:
-            return {"found": False, "reason": "invalidated_in_window", "violation_idx": j}
+    second_idx = first_idx + 1
+    if second_idx >= len(data) or second_idx > first_idx + int(max_window):
+        return {"found": False, "reason": "no_second_in_window"}
+    row = data.iloc[second_idx]
+    close = float(row["close"])
+    if direction == "up" and close < level:
+        return {"found": False, "reason": "invalidated_before_second", "violation_idx": second_idx}
+    if direction == "down" and close > level:
+        return {"found": False, "reason": "invalidated_before_second", "violation_idx": second_idx}
+    directional = (_is_bullish(row) and close > level) if direction == "up" else (_is_bearish(row) and close < level)
+    if not directional or _body_ratio(row) < BODY_RATIO_MIN:
+        return {"found": False, "reason": "second_candle_not_confirmed", "second_idx": second_idx}
 
-        if (direction == "up" and close > level) or (direction == "down" and close < level):
-            return {
-                "found": True, "first_idx": first_idx, "second_idx": j,
-                "entry": close, "entry_time": _time_of(data, j),
-                "body_ratio": round(_body_ratio(row), 2),
-                "candles_after_first": j - first_idx,
-            }
-    return {"found": False, "reason": "no_second_in_window"}
+    return {"found": True, "first_idx": first_idx, "second_idx": second_idx,
+            "entry": close, "entry_time": _time_of(data, second_idx),
+            "body_ratio": round(_body_ratio(row), 2),
+            "candles_after_first": 1}
 
 
 # ============================================================
 # 5. المسار الثاني: تأكيد 1H
 # ============================================================
 def find_confirmation_1h(df_1h, retest_info, direction):
-    if not _valid_df(df_1h) or len(df_1h) < 2 or not retest_info:
+    if not _valid_df(df_1h) or not retest_info:
         return {"confirmed": False, "reason": "no_data"}
-
     data = _sorted_df(df_1h)
     retest_high = retest_info.get("retest_high")
     retest_low = retest_info.get("retest_low")
@@ -412,18 +401,18 @@ def find_confirmation_1h(df_1h, retest_info, direction):
     candidates = _positions_after(data, retest_time, strict=True)[:MAX_1H_CONFIRM_CANDLES]
     if not candidates:
         return {"confirmed": False, "reason": "no_1h_after_retest"}
-
     for i in candidates:
         row = data.iloc[i]
         close = float(row["close"])
-        if direction == "up" and retest_high is not None and close > float(retest_high):
-            return {"confirmed": True, "confirm_idx": i, "entry": close,
-                    "confirm_time": _time_of(data, i),
-                    "body_ratio": round(_body_ratio(row), 2)}
-        if direction == "down" and retest_low is not None and close < float(retest_low):
-            return {"confirmed": True, "confirm_idx": i, "entry": close,
-                    "confirm_time": _time_of(data, i),
-                    "body_ratio": round(_body_ratio(row), 2)}
+        body = _body_ratio(row)
+        if direction == "up" and retest_high is not None:
+            if close > float(retest_high) and _is_bullish(row) and body >= BODY_RATIO_MIN:
+                return {"confirmed": True, "confirm_idx": i, "entry": close,
+                        "confirm_time": _time_of(data, i), "body_ratio": round(body, 2)}
+        if direction == "down" and retest_low is not None:
+            if close < float(retest_low) and _is_bearish(row) and body >= BODY_RATIO_MIN:
+                return {"confirmed": True, "confirm_idx": i, "entry": close,
+                        "confirm_time": _time_of(data, i), "body_ratio": round(body, 2)}
     return {"confirmed": False, "reason": "no_confirmation"}
 
 
@@ -463,7 +452,12 @@ def _build_result(direction, stage, entry, target1, target2, stop,
     if any(v is None or not np.isfinite(float(v)) for v in (entry, target1, stop)):
         return None
     entry, target1, stop = float(entry), float(target1), float(stop)
-    risk = abs(entry - stop)
+    # الوقف يجب أن يكون في الجهة الصحيحة من الدخول، لا نستخدم abs لإخفاء وقف غير صالح.
+    if direction == "up" and stop >= entry:
+        return None
+    if direction == "down" and stop <= entry:
+        return None
+    risk = (entry - stop) if direction == "up" else (stop - entry)
     reward = (target1 - entry) if direction == "up" else (entry - target1)
     if risk <= 0 or reward <= 0:
         return None
@@ -479,7 +473,8 @@ def _build_result(direction, stage, entry, target1, target2, stop,
     if target2 is not None and np.isfinite(float(target2)):
         target2 = float(target2)
         target2_is_ahead = target2 > entry if direction == "up" else target2 < entry
-        if target2_is_ahead:
+        target2_is_beyond_target1 = target2 > target1 if direction == "up" else target2 < target1
+        if target2_is_ahead and target2_is_beyond_target1:
             levels["target2"] = round(target2, 2)
 
     return {
@@ -526,38 +521,39 @@ def scan_setup(df_weekly, df_daily, df_4h, df_1h):
 
     df_weekly, df_daily, df_4h, df_1h = [_sorted_df(d) for d in frames]
 
-    # ✅ إصلاح جوهري: تحديد المستويات زمنياً، لا موضعياً
     now_ny = _now_market()
-    w_high, w_low = get_prev_week_levels(df_weekly, now_ny)
-    d_high, d_low = get_prev_day_levels(df_daily, now_ny)
+    display_w_high, display_w_low = get_prev_week_levels(df_weekly, now_ny)
+    display_d_high, display_d_low = get_prev_day_levels(df_daily, now_ny)
 
     sr_dict = {
-        "weekly": {"support": round(w_low, 2) if w_low is not None else None,
-                   "resistance": round(w_high, 2) if w_high is not None else None},
-        "daily": {"support": round(d_low, 2) if d_low is not None else None,
-                  "resistance": round(d_high, 2) if d_high is not None else None},
+        "weekly": {"support": round(display_w_low, 2) if display_w_low is not None else None,
+                   "resistance": round(display_w_high, 2) if display_w_high is not None else None},
+        "daily": {"support": round(display_d_low, 2) if display_d_low is not None else None,
+                  "resistance": round(display_d_high, 2) if display_d_high is not None else None},
     }
     tfs = [_tf_snapshot(df_weekly, "1W"), _tf_snapshot(df_daily, "1D"),
            _tf_snapshot(df_4h, "4H"), _tf_snapshot(df_1h, "1H")]
 
     atr4s, atr1s = atr(df_4h), atr(df_1h)
-    atr_4h = float(atr4s.iloc[-1]) if len(atr4s) and pd.notna(atr4s.iloc[-1]) else np.nan
-    atr_1h = float(atr1s.iloc[-1]) if len(atr1s) and pd.notna(atr1s.iloc[-1]) else np.nan
-    if not np.isfinite(atr_4h) or atr_4h <= 0 or not np.isfinite(atr_1h) or atr_1h <= 0:
+    if len(atr4s) == 0 or len(atr1s) == 0:
         return _empty_result(sr_dict, tfs)
 
-    # ── المسار الأول: إغلاق يومي خارج قمة/قاع الأسبوع السابق
-    for direction, level in (("up", w_high), ("down", w_low)):
-        if level is None:
-            continue
-        brk = check_breakout(df_daily, level, direction)
+    # ── المسار الأول
+    for direction in ("up", "down"):
+        brk = check_breakout_dynamic(df_daily, df_weekly, direction)
         if not brk.get("broken"):
             continue
-        retest = find_retest(df_4h, level, direction, brk["break_time"], atr_4h)
+        level = float(brk["level"])
+        retest = find_retest(df_4h, level, direction, brk["break_time"])
         if not retest.get("retested"):
             continue
         second = find_second_candle(df_4h, level, direction, retest["retest_idx"])
         if not second.get("found"):
+            continue
+        if int(second["second_idx"]) != len(df_4h) - 1:
+            continue
+        atr_4h = float(atr4s.iloc[int(second["second_idx"])]) if pd.notna(atr4s.iloc[int(second["second_idx"])]) else np.nan
+        if not np.isfinite(atr_4h) or atr_4h <= 0:
             continue
         stab = check_stability(df_4h, level, direction,
                                 retest["retest_idx"], second["second_idx"])
@@ -565,8 +561,15 @@ def scan_setup(df_weekly, df_daily, df_4h, df_1h):
             continue
 
         entry = second["entry"]
-        target1 = _extreme_until(df_4h, brk["break_time"], second["entry_time"],
-                                  direction, include_since=True)
+        entry_time = pd.to_datetime(second["entry_time"], utc=True)
+        daily_break_row = df_daily.iloc[int(brk["break_index"])]
+        target1 = float(daily_break_row["high"] if direction == "up" else daily_break_row["low"])
+        start_time = pd.to_datetime(brk["break_time"], utc=True)
+        prior_rows = df_4h[(df_4h["close_time"] < entry_time) &
+                           (df_4h["close_time"] >= start_time)]
+        if not prior_rows.empty:
+            continuation = float(prior_rows["high"].max() if direction == "up" else prior_rows["low"].min())
+            target1 = max(target1, continuation) if direction == "up" else min(target1, continuation)
         if target1 is None:
             continue
         stop = (retest["retest_low"] - ATR_MULTIPLIER * atr_4h
@@ -580,18 +583,30 @@ def scan_setup(df_weekly, df_daily, df_4h, df_1h):
         if result:
             return result
 
-    # ── المسار الثاني: إغلاق 4H خارج قمة/قاع اليوم السابق
-    for direction, level in (("up", d_high), ("down", d_low)):
-        if level is None:
-            continue
-        brk = check_breakout(df_4h, level, direction)
+    # ── المسار الثاني
+    last_daily_row = df_daily.iloc[-1]
+    prior_week_high, prior_week_low = _reference_levels_before(
+        df_weekly, last_daily_row["close_time"])
+    path2_directions = []
+    if prior_week_high is not None and float(last_daily_row["close"]) <= prior_week_high:
+        path2_directions.append("up")
+    if prior_week_low is not None and float(last_daily_row["close"]) >= prior_week_low:
+        path2_directions.append("down")
+    for direction in path2_directions:
+        brk = check_breakout_dynamic(df_4h, df_daily, direction)
         if not brk.get("broken"):
             continue
-        retest = find_retest(df_4h, level, direction, brk["break_time"], atr_4h)
+        level = float(brk["level"])
+        retest = find_retest(df_4h, level, direction, brk["break_time"])
         if not retest.get("retested"):
             continue
         confirm = find_confirmation_1h(df_1h, retest, direction)
         if not confirm.get("confirmed"):
+            continue
+        if int(confirm["confirm_idx"]) != len(df_1h) - 1:
+            continue
+        atr_1h = float(atr1s.iloc[int(confirm["confirm_idx"])]) if pd.notna(atr1s.iloc[int(confirm["confirm_idx"])]) else np.nan
+        if not np.isfinite(atr_1h) or atr_1h <= 0:
             continue
 
         confirm_time = confirm.get("confirm_time")
@@ -607,11 +622,17 @@ def scan_setup(df_weekly, df_daily, df_4h, df_1h):
             continue
 
         entry = confirm["entry"]
-        target1 = _extreme_until(df_4h, brk["break_time"], confirm_time,
-                                  direction, include_since=True)
-        if target1 is None:
+        # ✅ لا نستخدم شمعة التأكيد لحساب الهدف — نستبعدها صراحة (look-ahead prevention).
+        confirm_ts = pd.to_datetime(confirm_time, utc=True)
+        start_ts = pd.to_datetime(brk["break_time"], utc=True)
+        prior_rows = df_4h[(df_4h["close_time"] < confirm_ts) &
+                           (df_4h["close_time"] >= start_ts)]
+        if prior_rows.empty:
             continue
-        target2 = w_high if direction == "up" else w_low
+        target1 = (float(prior_rows["high"].max()) if direction == "up"
+                   else float(prior_rows["low"].min()))
+        target2_high, target2_low = _reference_levels_before(df_weekly, brk["break_time"])
+        target2 = target2_high if direction == "up" else target2_low
         stop = (retest["retest_low"] - ATR_MULTIPLIER * atr_1h
                 if direction == "up"
                 else retest["retest_high"] + ATR_MULTIPLIER * atr_1h)
@@ -632,4 +653,5 @@ def scan_setup(df_weekly, df_daily, df_4h, df_1h):
 def last_price(df):
     if not _valid_df(df):
         return None
-    return float(df.iloc[-1]["close"])
+    data = _sorted_df(df)
+    return float(data.iloc[-1]["close"]) if not data.empty else None
