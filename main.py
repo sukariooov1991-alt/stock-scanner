@@ -37,7 +37,12 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # ✅ Gemini
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODELS  = ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash"]
+GEMINI_MODELS  = [
+    "gemini-3.8-flash",       # ✅ النموذج الأساسي الموصى به
+    "gemini-3.5-flash-lite",  # ✅ بديل أسرع
+    "gemini-3.1-flash-lite",  # ✅ بديل أخف
+    "gemini-3.6-flash",       # ✅ بديل إضافي
+]
 GEMINI_TIMEOUT = 12
 
 _quote_ctx: QuoteContext | None = None
@@ -698,7 +703,6 @@ def analyze_symbol(symbol: str) -> dict:
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-    # ✅ تحليل ذكي (Gemini)
     try:
         ai_text = get_ai_analysis(result)
         if ai_text:
@@ -886,7 +890,7 @@ async def lifespan(app: FastAPI):
         ctx.set_on_quote(_on_quote)
         print("[STARTUP] ready", flush=True)
         if GEMINI_API_KEY:
-            print("[STARTUP] Gemini key detected", flush=True)
+            print(f"[STARTUP] Gemini enabled — models: {GEMINI_MODELS}", flush=True)
         else:
             print("[STARTUP] Gemini key MISSING — AI analysis disabled", flush=True)
     except Exception as e:
@@ -943,7 +947,8 @@ def test_telegram():
 @app.get("/api/test-gemini")
 def test_gemini():
     if not GEMINI_API_KEY:
-        return {"ok": False, "reason": "GEMINI_API_KEY not set"}
+        return {"ok": False, "reason": "GEMINI_API_KEY not set",
+                "models_tried": GEMINI_MODELS}
     sample = {
         "symbol": "TEST",
         "price": 100.0,
@@ -959,7 +964,7 @@ def test_gemini():
         ],
     }
     text = get_ai_analysis(sample)
-    return {"ok": bool(text), "text": text}
+    return {"ok": bool(text), "text": text, "models_tried": GEMINI_MODELS}
 
 
 @app.get("/api/symbols")
@@ -1059,6 +1064,7 @@ def cache_stats():
         "monitoring_count": len(_monitoring),
         "symbols_total": len(SCAN_SYMBOLS),
         "gemini_enabled": bool(GEMINI_API_KEY),
+        "gemini_models": GEMINI_MODELS,
     }
 
 
