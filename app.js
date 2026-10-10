@@ -1,5 +1,5 @@
 /* ============================================================
-   app.js — Longbridge Scanner (النسخة النهائية + Gemini)
+   app.js — Longbridge Scanner (النسخة النهائية + Gemini async)
    ============================================================ */
 const API_BASE = window.location.origin;
 
@@ -10,6 +10,12 @@ let monitorTimers = new Map();
 let pricePollTimer = null;
 let lastAlertedState = {};
 let deletedSymbols = new Set();
+
+// ✅ منع تكرار طلب Gemini لنفس السهم
+const aiRequested = new Set();
+// ✅ قائمة انتظار طلبات Gemini (لتجنب إغراق الـ endpoint)
+const aiQueue = [];
+let aiQueueRunning = false;
 
 const VALID_COLORS = ["green", "red"];
 const DEAD_STATUSES = ["stop_hit", "target_hit", "expired"];
@@ -142,6 +148,44 @@ function monitorStatusLabel(s) {
   if (s === "expired")    return { label: "⏰ منتهي", cls: "ms-expired" };
   if (s === "active")     return { label: "🟢 مراقبة", cls: "ms-active" };
   return { label: "", cls: "" };
+}
+
+/* ============================================================
+   ✅ Gemini — طلب التحليل بعد عرض البطاقة (Async, لا يعطّل شيئاً)
+   ============================================================ */
+function enqueueAIRequest(symbol) {
+  if (!symbol || aiRequested.has(symbol)) return;
+  aiRequested.add(symbol);
+  aiQueue.push(symbol);
+  if (!aiQueueRunning) runAIQueue();
+}
+
+async function runAIQueue() {
+  aiQueueRunning = true;
+  while (aiQueue.length > 0) {
+    const sym = aiQueue.shift();
+    try {
+      const r = await fetch(`${API_BASE}/api/ai/${sym}`);
+      if (r.ok) {
+        const d = await r.json();
+        if (d.ok && d.text) {
+          const card = scanCards.find(c => c.symbol === sym);
+          if (card) {
+            card.ai_analysis = d.text;
+            const el = cardsArea.querySelector(`[data-symbol="${sym}"]`);
+            if (el) {
+              const sumWrap = el.querySelector("[data-summary-wrap]");
+              if (sumWrap) sumWrap.innerHTML = buildSummaryBar(card);
+            }
+            saveCards();
+          }
+        }
+      }
+    } catch (e) { /* تجاهل أخطاء الشبكة */ }
+    // فاصل صغير بين الطلبات لتفادي rate-limit
+    await new Promise(r => setTimeout(r, 800));
+  }
+  aiQueueRunning = false;
 }
 
 /* ===== OI Block ===== */
@@ -283,7 +327,7 @@ function buildTFBox(tf) {
   `;
 }
 
-/* ===== Summary Bar (مع تحليل Gemini) ===== */
+/* ===== Summary Bar ===== */
 function buildSummaryBar(cardData) {
   const c = cardData.card || {};
   const color = c.color || "gray";
@@ -430,6 +474,11 @@ function buildCard(cardData) {
     e.stopPropagation();
     await deleteCard(sym);
   });
+
+  // ✅ اطلب تحليل Gemini (Async — بعد ما ظهرت البطاقة كاملة)
+  if (!cardData.ai_analysis) {
+    enqueueAIRequest(sym);
+  }
 
   return div;
 }
@@ -578,6 +627,11 @@ function renderCards() {
   } else if (scanCards.length === 0) {
     emptyState.innerHTML = "<p>اضغط \"ابدأ المسح\" لفحص السوق</p>";
   }
+
+  // ✅ اطلب Gemini لأي بطاقة قديمة محمّلة من localStorage ليس لديها تحليل بعد
+  filtered.forEach(cardData => {
+    if (!cardData.ai_analysis) enqueueAIRequest(cardData.symbol);
+  });
 }
 
 /* ===== Scan ===== */
@@ -631,7 +685,10 @@ function mergeScanResults(newResults) {
 
     const existing = existingMap.get(sym);
     if (existing) {
+      // نحتفظ بالتحليل الذكي إن وجد
+      const aiText = existing.ai_analysis;
       Object.assign(existing, newCard);
+      if (!existing.ai_analysis && aiText) existing.ai_analysis = aiText;
     } else {
       scanCards.push(newCard);
     }
