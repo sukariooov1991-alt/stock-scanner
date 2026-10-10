@@ -4,12 +4,9 @@ main.py — Longbridge Options Radar Scanner
 + توحيد صريح للأوقات
 + رفض الإشارات الميتة
 + تحليل ذكي عبر Gemini (منفصل)
-+ اختيار العقد: من الـ strikes الحقيقية، مع تجربة بدائل
-+ OI/Whales تُجلب دائماً
-+ معالجة السوق المغلق (تخطي فلتر السبريد)
-+ تسجيل أول سبب فشل
-+ حد OTM أقصى 8%
-+ SPY, QQQ, IWM, SPCX
++ قائمة نظيفة: S&P 100 + Nasdaq 100 (ميجا + لارج كاب)
++ اختيار العقد: من الـ strikes الحقيقية، الأقرب لـ 2% OTM، مع تجربة بدائل
++ OI/Whales تُجلب دائماً (لا return مبكر)
 """
 import os
 import time
@@ -20,6 +17,7 @@ import requests
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, date as date_cls
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,8 +28,10 @@ from longbridge.openapi import (
     TradeSessions, SubType, PushQuote,
 )
 
+from market_time import candles_to_df
+
 from analysis import (
-    atr, check_breakout, find_retest,
+    atr, find_retest,
     scan_setup,
 )
 
@@ -41,6 +41,7 @@ _lb_config = Config.from_apikey_env()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+# ✅ Gemini
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODELS  = [
     "gemini-3.8-flash",
@@ -59,19 +60,21 @@ _ANALYZE_TTL = 25
 _ai_cache: dict[str, tuple[float, str]] = {}
 _AI_CACHE_TTL = 1800
 
+# ✅ فلاتر العقد
 MAX_PREMIUM = 2.5
 MAX_SPREAD  = 0.10
 DTE_MIN     = 5
 DTE_MAX     = 20
 DTE_TARGET  = 10
-OTM_TARGET  = 0.02
-OTM_MAX     = 0.08
-MAX_CANDIDATES = 10
+OTM_TARGET  = 0.02          # الهدف: 2% OTM
+OTM_MIN     = 0.005         # الحد الأدنى المسموح: 0.5% OTM
+OTM_MAX     = 0.04          # الحد الأعلى المسموح: 4% OTM
+MAX_CANDIDATES = 10         # كم strike نجرّب قبل الاستسلام
 
-CLOSED_MARKET_SPREAD_THRESHOLD = 0.50
-
+# ✅ فلتر السعر الأدنى
 MIN_PRICE = 50.0
 
+# ✅ Cache
 _candle_cache: dict[str, tuple[float, list]] = {}
 _CANDLE_TTL = {"1h": 300, "4h": 900, "1d": 3600, "1w": 3600}
 _CANDLE_CACHE_MAX = 5000
@@ -88,15 +91,11 @@ OPTION_QUOTE_BATCH = 50
 VALID_COLORS = ("green", "red")
 DEAD_STATUSES = ("stop_hit", "target_hit", "expired")
 
-_TF_SECONDS = {"1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800}
 
 # ============================================================
-# قائمة الأسهم + صناديق المؤشرات (SPX محذوف، SPCX مضاف)
+# ✅ قائمة نظيفة: S&P 100 + Nasdaq 100 (ميجا + لارج كاب)
 # ============================================================
 SCAN_SYMBOLS = list(dict.fromkeys([
-    # ── صناديق المؤشرات (ETFs) ──
-    "SPY", "QQQ", "IWM", "SPCX",
-
     # ── التكنولوجيا ──
     "AAPL", "MSFT", "NVDA", "GOOGL", "GOOG", "AMZN", "META", "AVGO",
     "TSLA", "ORCL", "CRM", "ADBE", "AMD", "INTC", "QCOM", "TXN",
@@ -193,18 +192,6 @@ def norm(symbol: str) -> str:
     return s if "." in s else f"{s}.US"
 
 
-def _safe_quote(symbol: str) -> tuple[float | None, float | None]:
-    try:
-        q_list = get_ctx().quote([norm(symbol)])
-        if not q_list:
-            return None, None
-        q = q_list[0]
-        return float(q.last_done), float(q.prev_close)
-    except Exception as e:
-        print(f"[QUOTE] {symbol}: {e}", flush=True)
-        return None, None
-
-
 def send_telegram_alert(message: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
@@ -295,6 +282,7 @@ def _call_gemini_once(prompt: str, model: str) -> str | None:
             return None
         d = r.json()
         if d.get("promptFeedback", {}).get("blockReason"):
+            print(f"[GEMINI] {model} blocked: {d['promptFeedback']['blockReason']}", flush=True)
             return None
         cands = d.get("candidates") or []
         if not cands:
@@ -324,46 +312,7 @@ def get_ai_analysis(data: dict) -> str | None:
     return None
 
 
-# ============================================================
-# تحويل الشموع
-# ============================================================
-def candles_to_df(candles, timeframe=None):
-    import pandas as pd
-    rows = [{
-        "time": c.timestamp, "open": float(c.open), "high": float(c.high),
-        "low": float(c.low), "close": float(c.close), "volume": int(c.volume),
-    } for c in candles]
-    df = pd.DataFrame(rows)
-    if df.empty or timeframe not in _TF_SECONDS or "time" not in df:
-        return df
-
-    seconds = _TF_SECONDS[timeframe]
-    try:
-        raw = df["time"]
-        if pd.api.types.is_numeric_dtype(raw):
-            starts = pd.to_datetime(raw, unit="s", utc=True)
-        else:
-            starts = pd.to_datetime(raw, utc=True)
-        closes = starts + pd.Timedelta(seconds=seconds)
-        now = pd.Timestamp.now(tz="UTC")
-
-        mask = closes <= now
-        df = df.loc[mask].copy()
-        starts = starts.loc[mask]
-        closes = closes.loc[mask]
-        if df.empty:
-            return df.reset_index(drop=True)
-
-        df["time"] = starts.values
-        df["close_time"] = closes.values
-    except Exception:
-        df = df.iloc[:-1].copy()
-        try:
-            df["time"] = pd.to_datetime(df["time"], utc=True)
-            df["close_time"] = df["time"] + pd.Timedelta(seconds=seconds)
-        except Exception:
-            pass
-    return df.reset_index(drop=True)
+# تحويل الشموع موجود في market_time.py ويستخدم تقويم جلسات NYSE الفعلي.
 
 
 PERIOD_MAP = {
@@ -392,7 +341,7 @@ def fetch_candles(symbol, timeframe, count=200):
 
     candles = ctx.candlesticks(norm(symbol), p, count,
                                 AdjustType.NoAdjust,
-                                trade_sessions=TradeSessions.All)
+                                trade_sessions=TradeSessions.Intraday)
 
     if len(_candle_cache) > _CANDLE_CACHE_MAX:
         oldest = sorted(_candle_cache.items(), key=lambda x: x[1][0])[:1000]
@@ -404,7 +353,15 @@ def fetch_candles(symbol, timeframe, count=200):
 
 
 def get_current_price(symbol: str):
-    return _safe_quote(symbol)[0]
+    try:
+        ctx = get_ctx()
+        sym = norm(symbol)
+        q = ctx.quote([sym])
+        if q:
+            return float(q[0].last_done)
+    except Exception:
+        pass
+    return None
 
 
 # ============================================================
@@ -445,6 +402,7 @@ def _empty_option_result():
 
 
 def _quote_one(ctx, sym_opt):
+    """يجلب اقتباس عقد واحد، يعيد dict أو None."""
     try:
         oqs = ctx.option_quote([sym_opt])
         if not oqs:
@@ -466,6 +424,7 @@ def _quote_one(ctx, sym_opt):
 
 
 def _try_strike(ctx, opt_sym):
+    """يجرّب عقداً واحداً، يعيد (pass, premium, spread, delta, reason)."""
     if not opt_sym:
         return False, None, None, None, "no_symbol"
     q = _quote_one(ctx, opt_sym)
@@ -482,15 +441,18 @@ def _try_strike(ctx, opt_sym):
         return False, None, spread, delta, "no_premium"
     if entry > MAX_PREMIUM:
         return False, round(entry, 2), spread, delta, "premium_too_high"
-
-    market_closed = (bid == 0 or ask == 0 or spread > CLOSED_MARKET_SPREAD_THRESHOLD)
-    if not market_closed and spread > MAX_SPREAD:
+    if spread > MAX_SPREAD:
         return False, round(entry, 2), spread, delta, "spread_too_wide"
-
     return True, round(entry, 2), spread, delta, "ok"
 
 
 def fetch_option_data(symbol, direction, price, strategy="swing"):
+    """
+    يجلب بيانات الخيارات:
+    - يجرّب أقرب الـ strikes الحقيقية إلى 2% OTM ضمن نطاق 0.5%–4%
+    - يقبل أول عقد يستوفي الفلاتر (سعر + سبريد)
+    - يجلب OI/Whales دائماً (بغض النظر عن نجاح العقد)
+    """
     ctx = get_ctx()
     sym = norm(symbol)
     result = _empty_option_result()
@@ -500,7 +462,8 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
             result["filter_reason"] = "no_dates"
             return result
 
-        today = datetime.now(timezone.utc).date()
+        # تاريخ DTE يُحسب حسب جلسة السوق الأمريكي، لا حسب UTC حتى لا ينحرف يومًا.
+        today = datetime.now(ZoneInfo("America/New_York")).date()
         parsed = []
         for d in raw_dates:
             if isinstance(d, date_cls):
@@ -540,23 +503,27 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
         is_call = (direction == "bullish")
         target_price = price * (1 + OTM_TARGET) if is_call else price * (1 - OTM_TARGET)
 
-        if is_call:
-            lo = price * (1 + 0.005)
-            hi = price * (1 + OTM_MAX)
-            cands = [c for c in chain
-                     if _call_of(c) and lo <= _strike_of(c) <= hi]
-        else:
-            lo = price * (1 - OTM_MAX)
-            hi = price * (1 - 0.005)
-            cands = [c for c in chain
-                     if _put_of(c) and lo <= _strike_of(c) <= hi]
+        # اجمع strikes الحقيقية داخل النطاق المتفق عليه 0.5%–4% OTM فقط.
+        # لا نسمح بالانزلاق إلى عقد أبعد من النطاق لمجرد أن سعره/سبريده مناسب.
+        cands = []
+        for c in chain:
+            strike = _strike_of(c)
+            opt_sym = _call_of(c) if is_call else _put_of(c)
+            if not opt_sym or strike is None or price <= 0:
+                continue
+            otm_pct = ((strike - price) / price) if is_call else ((price - strike) / price)
+            if OTM_MIN <= otm_pct <= OTM_MAX:
+                cands.append(c)
 
         if not cands:
-            result["filter_reason"] = "no_call_strike_in_range" if is_call else "no_put_strike_in_range"
+            result["filter_reason"] = "no_call_strike_in_otm_range" if is_call else "no_put_strike_in_otm_range"
+            # نكمل لجلب OI/Whales، لكن لا نختار عقدًا خارج النطاق.
         else:
+            # الأقرب إلى 2% OTM أولاً، مع تجربة البدائل المقبولة فقط.
             cands.sort(key=lambda c: abs(_strike_of(c) - target_price))
+
+            # ✅ 3) جرّب كل مرشح حتى نجد عقداً مقبولاً
             chosen = None
-            first_failure_reason = None
             for c in cands[:MAX_CANDIDATES]:
                 sk = _strike_of(c)
                 opt_sym = _call_of(c) if is_call else _put_of(c)
@@ -569,17 +536,21 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
                     result["filter_pass"] = True
                     break
                 else:
-                    if first_failure_reason is None:
-                        first_failure_reason = f"{reason} @ {int(sk)}"
+                    # سجّل آخر سبب فشل
+                    result["filter_reason"] = f"{reason} @ {int(sk)}"
 
             if chosen:
                 result["strike"] = f"{'C' if is_call else 'P'} {int(chosen['strike'])}"
                 result["premium"] = chosen["premium"]
                 if chosen["delta"] is not None:
                     result["delta"] = chosen["delta"]
+                # احتفظ بالرمز لاستخدامه لاحقاً في التحليل
+                result["_opt_sym"] = chosen["sym"]
             else:
-                result["filter_reason"] = first_failure_reason or "no_suitable_contract"
+                # لم نجد عقداً مقبولاً — لكن نكمل
+                result["filter_reason"] = result["filter_reason"] or "no_suitable_contract"
 
+        # ✅ 4) اجلب OI/Volume/Whales دائماً
         strikes_map = {}
         for c in chain:
             sk = _strike_of(c)
@@ -589,11 +560,14 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
             ps = _put_of(c)  or build_put_sym(sk)
             strikes_map[sk] = (cs, ps)
 
+        # للعرض: 5 CALL فوق السعر + 5 PUT تحت السعر
         calls_above = sorted([s for s in strikes_map.keys() if s > price])[:NEARBY_STRIKES]
         puts_below  = sorted([s for s in strikes_map.keys() if s < price],
                               reverse=True)[:NEARBY_STRIKES]
+
         display_strikes = sorted(set(calls_above + puts_below))
 
+        # اجمع كل الرموز المطلوبة
         all_syms_set = set()
         for sk in display_strikes:
             cs, ps = strikes_map.get(sk, (None, None))
@@ -609,6 +583,7 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
                     for q in qs: qmap[q.symbol] = q
             except Exception: pass
 
+        # إجماليات CALL / PUT (من عيّنة العرض)
         tc_oi = tp_oi = tc_v = tp_v = 0
         cd = []
         for sk in sorted(display_strikes, reverse=True):
@@ -641,6 +616,7 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
         result["call_oi"] = cd
         result["put_oi"]  = pd_
 
+        # الحيتان
         whales = []
         for sk in display_strikes:
             cs, ps = strikes_map.get(sk, (None, None))
@@ -668,9 +644,13 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
         print(f"[OPT] {symbol} {e}", flush=True)
         result["filter_reason"] = f"exception: {e}"
 
+    result.pop("_opt_sym", None)
     return result
 
 
+# ============================================================
+# رفض الإشارات الميتة
+# ============================================================
 def _gray_result(symbol: str, price: float) -> dict:
     return {
         "symbol": symbol.upper(),
@@ -696,22 +676,22 @@ def _is_dead_signal(scan: dict, price: float) -> bool:
     return (price >= sp) or (price <= tp)
 
 
+# ============================================================
+# analyze_symbol — مع فلتر السعر
+# ============================================================
 def analyze_symbol(symbol: str) -> dict:
-    price, prev_close = _safe_quote(symbol)
-    if price is None:
-        return _gray_result(symbol, 0.0)
+    q = get_ctx().quote([norm(symbol)])[0]
+    price = float(q.last_done)
+    prev_close = float(q.prev_close)
 
+    # ✅ رفض الأسهم الرخيصة (قبل جلب الشموع — توفير كبير)
     if price < MIN_PRICE:
         return _gray_result(symbol, price)
 
-    try:
-        df_weekly = candles_to_df(fetch_candles(symbol, "1w", 150), "1w")
-        df_daily  = candles_to_df(fetch_candles(symbol, "1d", 400), "1d")
-        df_4h     = candles_to_df(fetch_candles(symbol, "4h", 200), "4h")
-        df_1h     = candles_to_df(fetch_candles(symbol, "1h", 200), "1h")
-    except Exception as e:
-        print(f"[CANDLES] {symbol}: {e}", flush=True)
-        return _gray_result(symbol, price)
+    df_weekly = candles_to_df(fetch_candles(symbol, "1w", 150), "1w")
+    df_daily  = candles_to_df(fetch_candles(symbol, "1d", 400), "1d")
+    df_4h     = candles_to_df(fetch_candles(symbol, "4h", 200), "4h")
+    df_1h     = candles_to_df(fetch_candles(symbol, "1h", 200), "1h")
 
     scan = scan_setup(df_weekly, df_daily, df_4h, df_1h)
 
@@ -749,9 +729,9 @@ def analyze_symbol(symbol: str) -> dict:
     return {
         "symbol": symbol.upper(),
         "price": round(price, 2),
-        "prevClose": round(prev_close or price, 2),
-        "change": round(price - (prev_close or price), 2),
-        "changePercent": round((price - (prev_close or price)) / (prev_close or price) * 100, 2) if prev_close else 0,
+        "prevClose": round(prev_close, 2),
+        "change": round(price - prev_close, 2),
+        "changePercent": round((price - prev_close) / prev_close * 100, 2) if prev_close else 0,
         "card": card,
         "levels": levels,
         "timeframes": timeframes,
@@ -793,6 +773,9 @@ def _purge_symbol_from_scans(symbol: str):
         scan["results"] = [r for r in results if r.get("symbol") != sym]
 
 
+# ============================================================
+# المسح
+# ============================================================
 async def analyze_one_safe(sym, semaphore):
     async with semaphore:
         try:
@@ -867,6 +850,9 @@ def cleanup_old_scans():
         _scans.pop(sid, None)
 
 
+# ============================================================
+# المراقبة
+# ============================================================
 async def monitor_task():
     await asyncio.sleep(60)
     while True:
@@ -931,6 +917,9 @@ async def monitor_task():
         await asyncio.sleep(MONITOR_INTERVAL)
 
 
+# ============================================================
+# FastAPI
+# ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _event_loop
@@ -1001,7 +990,8 @@ def test_gemini():
         return {"ok": False, "reason": "GEMINI_API_KEY not set",
                 "models_tried": GEMINI_MODELS}
     sample = {
-        "symbol": "TEST", "price": 100.0,
+        "symbol": "TEST",
+        "price": 100.0,
         "card": {"color": "green", "stage": "daily_break_weekly"},
         "levels": {"entry": 100, "stop": 98, "target1": 104, "rr": 2.0,
                    "level_broken": 99, "pattern": "hammer"},
@@ -1144,11 +1134,14 @@ def cache_stats():
         "min_price": MIN_PRICE,
         "max_premium": MAX_PREMIUM,
         "max_spread": MAX_SPREAD,
+        "dte_min": DTE_MIN,
+        "dte_max": DTE_MAX,
+        "dte_target": DTE_TARGET,
+        "otm_min": OTM_MIN,
         "otm_max": OTM_MAX,
-        "closed_market_spread_threshold": CLOSED_MARKET_SPREAD_THRESHOLD,
+        "otm_target": OTM_TARGET,
         "gemini_enabled": bool(GEMINI_API_KEY),
         "gemini_models": GEMINI_MODELS,
-        "scans_in_memory": len(_scans),
     }
 
 
