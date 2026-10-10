@@ -2,6 +2,8 @@
 main.py — Longbridge Options Radar Scanner
 النسخة النهائية — 4 فريمات، مساران، حذف الرمادي نهائياً
 + توحيد صريح للأوقات: time = بداية الشمعة، close_time = نهاية الشمعة
++ رفض الإشارات الميتة فوراً (السعر عند الوقف أو الهدف)
++ حذف فوري للميتة من كل الطبقات
 """
 import os
 import time
@@ -65,7 +67,10 @@ OPTION_QUOTE_BATCH = 50
 
 VALID_COLORS = ("green", "red")
 
-# ثواني كل إطار (لحساب close_time من وقت البداية)
+# حالات المراقبة التي تعني "الصفقة انتهت"
+DEAD_STATUSES = ("stop_hit", "target_hit", "expired")
+
+# ثواني كل إطار
 _TF_SECONDS = {"1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800}
 
 SCAN_SYMBOLS = list(dict.fromkeys([
@@ -154,11 +159,10 @@ def send_telegram_alert(message: str) -> bool:
 
 def candles_to_df(candles, timeframe=None):
     """
-    تحويل الشموع إلى DataFrame بأوقات موحّدة صراحة:
-      - time:       وقت بداية الشمعة (من مزود البيانات).
-      - close_time: وقت إغلاق الشمعة (محسوب = البداية + مدة الإطار).
-    تُستبعد آخر شمعة إذا لم يكن وقت إغلاقها قد مضى بعد (لم تكتمل).
-    تُستبعد أيضاً أي شمعة أخرى لم يكتمل وقت إغلاقها (حماية إضافية).
+    تحويل الشموع إلى DataFrame بأوقات موحّدة:
+      - time:       وقت بداية الشمعة.
+      - close_time: وقت إغلاق الشمعة = البداية + مدة الإطار.
+    تُستبعد كل شمعة لم يكتمل وقت إغلاقها.
     """
     import pandas as pd
     rows = [{
@@ -179,20 +183,16 @@ def candles_to_df(candles, timeframe=None):
         closes = starts + pd.Timedelta(seconds=seconds)
         now = pd.Timestamp.now(tz="UTC")
 
-        # استبعاد كل شمعة لم يكتمل وقت إغلاقها
         mask = closes <= now
         df = df.loc[mask].copy()
         starts = starts.loc[mask]
         closes = closes.loc[mask]
-
         if df.empty:
             return df.reset_index(drop=True)
 
-        # ✅ توحيد صريح للأعمدة
         df["time"] = starts.values
         df["close_time"] = closes.values
     except Exception:
-        # fail-closed: نُسقط آخر شمعة عند أي فشل
         df = df.iloc[:-1].copy()
         try:
             df["time"] = pd.to_datetime(df["time"], utc=True)
@@ -504,6 +504,41 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
 
 
 # ============================================================
+# رفض الإشارات الميتة — تُعيد "gray" (محذوفة في كل الطبقات)
+# ============================================================
+def _gray_result(symbol: str, price: float) -> dict:
+    return {
+        "symbol": symbol.upper(),
+        "price": round(price, 2),
+        "card": {"color": "gray", "label": "لا إشارة",
+                 "status": "none", "direction": None, "stage": None},
+    }
+
+
+def _is_dead_signal(scan: dict, price: float) -> bool:
+    """
+    ✅ إصلاح النقطة 1: إذا السعر الحالي وصل الوقف أو الهدف → الصفقة ميتة.
+    - CALL: ميتة إذا (price <= stop) أو (price >= target1)
+    - PUT:  ميتة إذا (price >= stop) أو (price <= target1)
+    """
+    if scan.get("color") not in VALID_COLORS:
+        return False
+    lv = scan.get("levels", {}) or {}
+    stop_p = lv.get("stop")
+    tgt_p = lv.get("target1")
+    if stop_p is None or tgt_p is None:
+        return False
+    try:
+        sp = float(stop_p)
+        tp = float(tgt_p)
+    except (TypeError, ValueError):
+        return False
+    if scan["color"] == "green":
+        return (price <= sp) or (price >= tp)
+    return (price >= sp) or (price <= tp)
+
+
+# ============================================================
 # analyze_symbol
 # ============================================================
 def analyze_symbol(symbol: str) -> dict:
@@ -518,14 +553,9 @@ def analyze_symbol(symbol: str) -> dict:
 
     scan = scan_setup(df_weekly, df_daily, df_4h, df_1h)
 
-    # ✅ الرمادي: توقف فوري — لا خيارات، لا شيء
-    if scan["color"] not in VALID_COLORS:
-        return {
-            "symbol": symbol.upper(),
-            "price": round(price, 2),
-            "card": {"color": "gray", "label": "لا إشارة",
-                     "status": "none", "direction": None, "stage": None},
-        }
+    # ✅ إصلاح النقطة 1: رفض الرمادي + رفض الإشارات الميتة
+    if scan["color"] not in VALID_COLORS or _is_dead_signal(scan, price):
+        return _gray_result(symbol, price)
 
     card = {
         "color":     scan["color"],
@@ -591,6 +621,18 @@ def analyze_cached(symbol):
     data = analyze_symbol(symbol)
     _analyze_cache[key] = (now, data)
     return data
+
+
+# ============================================================
+# ✅ إصلاح النقطة 2: حذف الرمز من كل المسحات عند موت الصفقة
+# ============================================================
+def _purge_symbol_from_scans(symbol: str):
+    sym = symbol.upper().strip()
+    for scan in _scans.values():
+        rm = scan.get("results_map") or {}
+        rm.pop(sym, None)
+        results = scan.get("results") or []
+        scan["results"] = [r for r in results if r.get("symbol") != sym]
 
 
 # ============================================================
@@ -687,7 +729,7 @@ async def monitor_task():
                 if not m: continue
 
                 if m["status"] != "active":
-                    if m["status"] in ("target_hit", "stop_hit", "expired"):
+                    if m["status"] in DEAD_STATUSES:
                         if now - m.get("ended_at", now) > 86400:
                             _monitoring.pop(sym, None)
                     continue
@@ -695,6 +737,8 @@ async def monitor_task():
                 if now >= m["expires_at"]:
                     m["status"] = "expired"
                     m["ended_at"] = now
+                    # ✅ إصلاح النقطة 2
+                    _purge_symbol_from_scans(sym)
                     await asyncio.to_thread(
                         send_telegram_alert,
                         f"⏰ <b>انتهت المدة</b> — {sym}\nمرت {MONITOR_DAYS} أيام."
@@ -715,6 +759,8 @@ async def monitor_task():
                         m["status"] = "target_hit"
                         m["ended_at"] = now
                         m["alerts_sent"].add("target")
+                        # ✅ إصلاح النقطة 2
+                        _purge_symbol_from_scans(sym)
                         await asyncio.to_thread(
                             send_telegram_alert,
                             f"✅ <b>تحقق الهدف</b> — {sym}\nالسعر: ${price:.2f}\nالهدف: ${target:.2f}"
@@ -728,6 +774,8 @@ async def monitor_task():
                         m["status"] = "stop_hit"
                         m["ended_at"] = now
                         m["alerts_sent"].add("stop")
+                        # ✅ إصلاح النقطة 2
+                        _purge_symbol_from_scans(sym)
                         await asyncio.to_thread(
                             send_telegram_alert,
                             f"❌ <b>ضرب الوقف</b> — {sym}\nالسعر: ${price:.2f}\nالوقف: ${stop:.2f}"
@@ -828,6 +876,9 @@ def scan_status(scan_id: str):
     for r in scan["results"]:
         sym = r.get("symbol")
         m = _monitoring.get(sym, {})
+        # ✅ إصلاح النقطة 3: لا نُرسل الصفقات الميتة
+        if m.get("status") in DEAD_STATUSES:
+            continue
         r_copy = dict(r)
         r_copy["monitor_status"] = m.get("status", "none")
         r_copy["monitor_price"] = m.get("last_price")
@@ -836,7 +887,7 @@ def scan_status(scan_id: str):
     return {
         "scan_id": scan_id, "status": scan["status"],
         "total": scan["total"], "completed": scan["completed"],
-        "found": len(scan["results"]), "results": results,
+        "found": len(results), "results": results,
         "errors_count": len(scan["errors"]),
     }
 
@@ -877,6 +928,7 @@ def monitor_remove(symbol: str):
     sym = symbol.upper().strip()
     if sym in _monitoring:
         _monitoring.pop(sym, None)
+    _purge_symbol_from_scans(sym)
     return {"ok": True}
 
 
