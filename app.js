@@ -1,5 +1,6 @@
 /* ============================================================
    app.js — Longbridge Scanner (النسخة النهائية)
+   + حذف البطاقات الميتة فوراً (وقف/هدف/منتهي)
    ============================================================ */
 const API_BASE = window.location.origin;
 
@@ -12,6 +13,7 @@ let lastAlertedState = {};
 let deletedSymbols = new Set();
 
 const VALID_COLORS = ["green", "red"];
+const DEAD_STATUSES = ["stop_hit", "target_hit", "expired"];
 
 /* ===== Storage ===== */
 function saveDeleted() {
@@ -25,8 +27,9 @@ function loadDeleted() {
 }
 function saveCards() {
   try {
-    // ✅ نحفظ فقط الأخضر والأحمر
-    const filtered = scanCards.filter(c => VALID_COLORS.includes(c.card?.color));
+    const filtered = scanCards
+      .filter(c => VALID_COLORS.includes(c.card?.color))
+      .filter(c => !DEAD_STATUSES.includes(c.monitor_status));
     localStorage.setItem("scanner_cards", JSON.stringify(filtered));
   } catch (e) {}
 }
@@ -35,8 +38,10 @@ function loadCards() {
     const r = localStorage.getItem("scanner_cards");
     if (!r) return [];
     const arr = JSON.parse(r);
-    // ✅ نحذف أي بطاقة رمادية محفوظة سابقاً
-    return arr.filter(c => VALID_COLORS.includes(c.card?.color));
+    // ✅ نحذف الرمادي والميت من التخزين
+    return arr
+      .filter(c => VALID_COLORS.includes(c.card?.color))
+      .filter(c => !DEAD_STATUSES.includes(c.monitor_status));
   } catch (e) { return []; }
 }
 
@@ -293,8 +298,8 @@ function buildSummaryBar(cardData) {
 /* ===== Build Card ===== */
 function buildCard(cardData) {
   const c = cardData.card || {};
-  // ✅ تجاهل الرمادي كلياً
   if (!VALID_COLORS.includes(c.color)) return null;
+  if (DEAD_STATUSES.includes(cardData.monitor_status)) return null;
 
   const lv = cardData.levels || {};
   const cls = c.color;
@@ -421,7 +426,7 @@ function updateAllDynamic(root, sym, card) {
 /* ===== Update In Place ===== */
 function updateCardInPlace(cardEl, data) {
   const c = data.card || {};
-  if (!VALID_COLORS.includes(c.color)) {
+  if (!VALID_COLORS.includes(c.color) || DEAD_STATUSES.includes(data.monitor_status)) {
     cardEl.remove();
     return;
   }
@@ -471,7 +476,7 @@ function updateCardInPlace(cardEl, data) {
   if (sumWrap) sumWrap.innerHTML = buildSummaryBar(data);
 }
 
-/* ===== Delete Card ===== */
+/* ===== Delete Card (يدوي) ===== */
 async function deleteCard(symbol) {
   scanCards = scanCards.filter(c => c.symbol !== symbol);
   deletedSymbols.add(symbol);
@@ -492,11 +497,31 @@ async function deleteCard(symbol) {
   if (scanCards.length === 0) emptyState.style.display = "block";
 }
 
+/* ===== ✅ Auto-Remove (عند موت الصفقة) ===== */
+function removeCardAuto(symbol) {
+  const before = scanCards.length;
+  scanCards = scanCards.filter(c => c.symbol !== symbol);
+  if (before === scanCards.length) return;
+
+  // لا نضيف إلى deletedSymbols — هذا حذف تلقائي وليس يدوي
+  saveCards();
+
+  if (monitorTimers.has(symbol)) {
+    clearInterval(monitorTimers.get(symbol));
+    monitorTimers.delete(symbol);
+  }
+
+  const el = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
+  if (el) el.remove();
+  if (scanCards.length === 0) emptyState.style.display = "block";
+}
+
 /* ===== Render ===== */
 function renderCards() {
   const filtered = scanCards
     .filter(c => !deletedSymbols.has(c.symbol))
     .filter(c => VALID_COLORS.includes(c.card?.color))
+    .filter(c => !DEAD_STATUSES.includes(c.monitor_status))
     .sort((a, b) => (b.levels?.rr ?? 0) - (a.levels?.rr ?? 0));
 
   Array.from(cardsArea.children).forEach(el => {
@@ -569,14 +594,19 @@ function resetScanButton() {
   scanBtn.querySelector(".scan-btn-text").textContent = "ابدأ المسح";
 }
 
+/* ===== ✅ إصلاح النقطة 4: فلترة الميت في merge ===== */
 function mergeScanResults(newResults) {
   const existingMap = new Map(scanCards.map(c => [c.symbol, c]));
 
   newResults.forEach(newCard => {
     const sym = newCard.symbol;
     if (deletedSymbols.has(sym)) return;
-    // ✅ تجاهل الرمادي كلياً
     if (!VALID_COLORS.includes(newCard.card?.color)) return;
+    if (DEAD_STATUSES.includes(newCard.monitor_status)) {
+      // إذا وصلت الإشارة كـ"ميتة" → احذف البطاقة إن كانت موجودة
+      removeCardAuto(sym);
+      return;
+    }
 
     const existing = existingMap.get(sym);
     if (existing) {
@@ -635,6 +665,7 @@ function startMonitoring() {
     const sym = card.symbol;
     if (deletedSymbols.has(sym)) return;
     if (!VALID_COLORS.includes(card.card?.color)) return;
+    if (DEAD_STATUSES.includes(card.monitor_status)) return;
     fetchMonitorStatus(sym);
     const timer = setInterval(() => fetchMonitorStatus(sym), 30000);
     monitorTimers.set(sym, timer);
@@ -643,13 +674,20 @@ function startMonitoring() {
   startPricePolling();
 }
 
+/* ===== ✅ إصلاح النقطة 4: عند موت الصفقة نحذف البطاقة ===== */
 async function fetchMonitorStatus(symbol) {
   if (deletedSymbols.has(symbol)) return;
   try {
     const mRes = await fetch(`${API_BASE}/api/monitor/${symbol}`);
     if (mRes.ok) {
       const m = await mRes.json();
-      if (m.monitored) updateCardMonitorStatus(symbol, m);
+      if (m.monitored) {
+        if (DEAD_STATUSES.includes(m.status)) {
+          removeCardAuto(symbol);
+          return;
+        }
+        updateCardMonitorStatus(symbol, m);
+      }
     }
   } catch (e) {}
 }
@@ -680,6 +718,7 @@ async function pollPrices() {
   for (const card of scanCards) {
     if (deletedSymbols.has(card.symbol)) continue;
     if (!VALID_COLORS.includes(card.card?.color)) continue;
+    if (DEAD_STATUSES.includes(card.monitor_status)) continue;
     try {
       const r = await fetch(`${API_BASE}/api/price/${card.symbol}`);
       if (!r.ok) continue;
@@ -708,7 +747,8 @@ function startPricePolling() {
   loadDeleted();
   scanCards = scanCards
     .filter(c => !deletedSymbols.has(c.symbol))
-    .filter(c => VALID_COLORS.includes(c.card?.color));
+    .filter(c => VALID_COLORS.includes(c.card?.color))
+    .filter(c => !DEAD_STATUSES.includes(c.monitor_status));
   saveCards();
   renderCards();
 
