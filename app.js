@@ -1,6 +1,5 @@
 /* ============================================================
-   app.js — Longbridge Scanner (النسخة النهائية)
-   + حذف البطاقات الميتة فوراً (وقف/هدف/منتهي)
+   app.js — Longbridge Scanner (النسخة النهائية + Gemini)
    ============================================================ */
 const API_BASE = window.location.origin;
 
@@ -38,11 +37,20 @@ function loadCards() {
     const r = localStorage.getItem("scanner_cards");
     if (!r) return [];
     const arr = JSON.parse(r);
-    // ✅ نحذف الرمادي والميت من التخزين
     return arr
       .filter(c => VALID_COLORS.includes(c.card?.color))
       .filter(c => !DEAD_STATUSES.includes(c.monitor_status));
   } catch (e) { return []; }
+}
+
+/* ===== Utils ===== */
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 /* ===== DOM ===== */
@@ -275,7 +283,7 @@ function buildTFBox(tf) {
   `;
 }
 
-/* ===== Summary Bar ===== */
+/* ===== Summary Bar (مع تحليل Gemini) ===== */
 function buildSummaryBar(cardData) {
   const c = cardData.card || {};
   const color = c.color || "gray";
@@ -284,13 +292,29 @@ function buildSummaryBar(cardData) {
   const rr = cardData.levels?.rr ?? "—";
   const rrOk = typeof rr === "number" && rr >= 2.0;
   const pattern = cardData.levels?.pattern || "";
+  const aiText = (cardData.ai_analysis || "").trim();
+
+  const aiBlock = aiText ? `
+    <div class="ai-analysis" style="width:100%;text-align:right;direction:rtl;
+         font-size:12.5px;line-height:1.85;color:var(--text);
+         padding:4px 6px 10px;border-bottom:1px dashed rgba(255,255,255,0.12);
+         margin-bottom:8px;white-space:pre-wrap;font-weight:500;">
+      <div style="font-size:10.5px;font-weight:700;color:var(--text-muted);
+                  margin-bottom:4px;">🤖 تحليل ذكي</div>
+      ${escapeHtml(aiText)}
+    </div>` : "";
 
   return `
-    <div class="summary-bar">
-      <span class="summary-badge badge-${color}">${label}</span>
-      ${stage ? `<span class="summary-item">${stage}</span><span class="summary-sep">·</span>` : ""}
-      ${pattern && pattern !== "none" ? `<span class="summary-item">${pattern}</span><span class="summary-sep">·</span>` : ""}
-      <span class="summary-item">R:R <b>${rr}</b> ${rrOk ? "✅" : "⚠️"}</span>
+    <div class="summary-bar" style="flex-direction:column;align-items:stretch;
+         border-radius:14px;padding:12px 14px;">
+      ${aiBlock}
+      <div style="display:flex;flex-wrap:wrap;gap:6px 8px;
+                  justify-content:center;align-items:center;">
+        <span class="summary-badge badge-${color}">${label}</span>
+        ${stage ? `<span class="summary-item">${stage}</span><span class="summary-sep">·</span>` : ""}
+        ${pattern && pattern !== "none" ? `<span class="summary-item">${pattern}</span><span class="summary-sep">·</span>` : ""}
+        <span class="summary-item">R:R <b>${rr}</b> ${rrOk ? "✅" : "⚠️"}</span>
+      </div>
     </div>
   `;
 }
@@ -497,13 +521,12 @@ async function deleteCard(symbol) {
   if (scanCards.length === 0) emptyState.style.display = "block";
 }
 
-/* ===== ✅ Auto-Remove (عند موت الصفقة) ===== */
+/* ===== Auto Remove ===== */
 function removeCardAuto(symbol) {
   const before = scanCards.length;
   scanCards = scanCards.filter(c => c.symbol !== symbol);
   if (before === scanCards.length) return;
 
-  // لا نضيف إلى deletedSymbols — هذا حذف تلقائي وليس يدوي
   saveCards();
 
   if (monitorTimers.has(symbol)) {
@@ -594,7 +617,6 @@ function resetScanButton() {
   scanBtn.querySelector(".scan-btn-text").textContent = "ابدأ المسح";
 }
 
-/* ===== ✅ إصلاح النقطة 4: فلترة الميت في merge ===== */
 function mergeScanResults(newResults) {
   const existingMap = new Map(scanCards.map(c => [c.symbol, c]));
 
@@ -603,7 +625,6 @@ function mergeScanResults(newResults) {
     if (deletedSymbols.has(sym)) return;
     if (!VALID_COLORS.includes(newCard.card?.color)) return;
     if (DEAD_STATUSES.includes(newCard.monitor_status)) {
-      // إذا وصلت الإشارة كـ"ميتة" → احذف البطاقة إن كانت موجودة
       removeCardAuto(sym);
       return;
     }
@@ -641,7 +662,6 @@ async function pollScanProgress() {
       currentScan = null;
       resetScanButton();
       progressWrap.style.display = d.status === "done" ? "none" : "block";
-
       startMonitoring();
     }
   } catch (e) {}
@@ -674,7 +694,6 @@ function startMonitoring() {
   startPricePolling();
 }
 
-/* ===== ✅ إصلاح النقطة 4: عند موت الصفقة نحذف البطاقة ===== */
 async function fetchMonitorStatus(symbol) {
   if (deletedSymbols.has(symbol)) return;
   try {
