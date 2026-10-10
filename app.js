@@ -1,6 +1,5 @@
 /* ============================================================
-   app.js — Longbridge Scanner
-   بدون وميض + Polling سعر مستقل + مربعات دعم/مقاومة
+   app.js — Longbridge Scanner (النسخة النهائية)
    ============================================================ */
 const API_BASE = window.location.origin;
 
@@ -11,6 +10,8 @@ let monitorTimers = new Map();
 let pricePollTimer = null;
 let lastAlertedState = {};
 let deletedSymbols = new Set();
+
+const VALID_COLORS = ["green", "red"];
 
 /* ===== Storage ===== */
 function saveDeleted() {
@@ -23,12 +24,19 @@ function loadDeleted() {
   } catch (e) {}
 }
 function saveCards() {
-  try { localStorage.setItem("scanner_cards", JSON.stringify(scanCards)); } catch (e) {}
+  try {
+    // ✅ نحفظ فقط الأخضر والأحمر
+    const filtered = scanCards.filter(c => VALID_COLORS.includes(c.card?.color));
+    localStorage.setItem("scanner_cards", JSON.stringify(filtered));
+  } catch (e) {}
 }
 function loadCards() {
   try {
     const r = localStorage.getItem("scanner_cards");
-    return r ? JSON.parse(r) : [];
+    if (!r) return [];
+    const arr = JSON.parse(r);
+    // ✅ نحذف أي بطاقة رمادية محفوظة سابقاً
+    return arr.filter(c => VALID_COLORS.includes(c.card?.color));
   } catch (e) { return []; }
 }
 
@@ -111,9 +119,8 @@ function checkSound(symbol, color) {
 
 /* ===== Labels ===== */
 function stageLabel(stage) {
-  if (stage === "daily_break_weekly") return "اليومي اخترق الأسبوعي";
-  if (stage === "4h_break_daily")     return "4H اخترق اليومي";
-  if (stage === "1h_break_4h")        return "1H اخترق 4H";
+  if (stage === "daily_break_weekly") return "اليومي اخترق الأسبوع";
+  if (stage === "4h_break_daily")     return "4H اخترق اليوم";
   return "";
 }
 function monitorStatusLabel(s) {
@@ -271,11 +278,13 @@ function buildSummaryBar(cardData) {
   const stage = c.stage ? stageLabel(c.stage) : "";
   const rr = cardData.levels?.rr ?? "—";
   const rrOk = typeof rr === "number" && rr >= 2.0;
+  const pattern = cardData.levels?.pattern || "";
 
   return `
     <div class="summary-bar">
       <span class="summary-badge badge-${color}">${label}</span>
       ${stage ? `<span class="summary-item">${stage}</span><span class="summary-sep">·</span>` : ""}
+      ${pattern && pattern !== "none" ? `<span class="summary-item">${pattern}</span><span class="summary-sep">·</span>` : ""}
       <span class="summary-item">R:R <b>${rr}</b> ${rrOk ? "✅" : "⚠️"}</span>
     </div>
   `;
@@ -284,8 +293,11 @@ function buildSummaryBar(cardData) {
 /* ===== Build Card ===== */
 function buildCard(cardData) {
   const c = cardData.card || {};
+  // ✅ تجاهل الرمادي كلياً
+  if (!VALID_COLORS.includes(c.color)) return null;
+
   const lv = cardData.levels || {};
-  const cls = c.color || "gray";
+  const cls = c.color;
   const price = cardData.price ?? 0;
   const sym = cardData.symbol;
   const monitorStatus = cardData.monitor_status || "none";
@@ -406,16 +418,19 @@ function updateAllDynamic(root, sym, card) {
   updateWhalesData(root, sym, card.whales || []);
 }
 
-/* ===== Update In Place (بدون وميض) ===== */
+/* ===== Update In Place ===== */
 function updateCardInPlace(cardEl, data) {
   const c = data.card || {};
+  if (!VALID_COLORS.includes(c.color)) {
+    cardEl.remove();
+    return;
+  }
   const lv = data.levels || {};
   const price = data.price ?? 0;
 
   const wasOpen = cardEl.classList.contains("open");
-  const oldCls = cardEl.className;
-  const newCls = "card " + (c.color || "gray") + (wasOpen ? " open" : "");
-  if (oldCls !== newCls) cardEl.className = newCls;
+  const newCls = "card " + c.color + (wasOpen ? " open" : "");
+  if (cardEl.className !== newCls) cardEl.className = newCls;
 
   const priceEl = cardEl.querySelector("[data-price]");
   if (priceEl) priceEl.textContent = "$" + price.toFixed(2);
@@ -477,13 +492,13 @@ async function deleteCard(symbol) {
   if (scanCards.length === 0) emptyState.style.display = "block";
 }
 
-/* ===== Render (بدون وميض) ===== */
+/* ===== Render ===== */
 function renderCards() {
   const filtered = scanCards
     .filter(c => !deletedSymbols.has(c.symbol))
+    .filter(c => VALID_COLORS.includes(c.card?.color))
     .sort((a, b) => (b.levels?.rr ?? 0) - (a.levels?.rr ?? 0));
 
-  // حذف البطاقات المُزالة
   Array.from(cardsArea.children).forEach(el => {
     if (el.classList && el.classList.contains("card")) {
       const sym = el.dataset.symbol;
@@ -491,7 +506,6 @@ function renderCards() {
     }
   });
 
-  // إضافة/تحديث
   filtered.forEach((cardData, idx) => {
     const sym = cardData.symbol;
     let el = cardsArea.querySelector(`[data-symbol="${sym}"]`);
@@ -500,6 +514,7 @@ function renderCards() {
       updateCardInPlace(el, cardData);
     } else {
       el = buildCard(cardData);
+      if (!el) return;
     }
 
     const current = Array.from(cardsArea.children).filter(c => c.classList && c.classList.contains("card"));
@@ -560,24 +575,12 @@ function mergeScanResults(newResults) {
   newResults.forEach(newCard => {
     const sym = newCard.symbol;
     if (deletedSymbols.has(sym)) return;
+    // ✅ تجاهل الرمادي كلياً
+    if (!VALID_COLORS.includes(newCard.card?.color)) return;
 
     const existing = existingMap.get(sym);
     if (existing) {
-      Object.assign(existing, {
-        card: newCard.card,
-        levels: newCard.levels,
-        timeframes: newCard.timeframes,
-        price: newCard.price,
-        support_resistance: newCard.support_resistance,
-        call_oi: newCard.call_oi,
-        put_oi: newCard.put_oi,
-        total_call_oi: newCard.total_call_oi,
-        total_put_oi: newCard.total_put_oi,
-        total_call_vol: newCard.total_call_vol,
-        total_put_vol: newCard.total_put_vol,
-        whales: newCard.whales,
-        monitor_status: newCard.monitor_status || existing.monitor_status,
-      });
+      Object.assign(existing, newCard);
     } else {
       scanCards.push(newCard);
     }
@@ -631,6 +634,7 @@ function startMonitoring() {
   scanCards.forEach(card => {
     const sym = card.symbol;
     if (deletedSymbols.has(sym)) return;
+    if (!VALID_COLORS.includes(card.card?.color)) return;
     fetchMonitorStatus(sym);
     const timer = setInterval(() => fetchMonitorStatus(sym), 30000);
     monitorTimers.set(sym, timer);
@@ -671,10 +675,11 @@ function updateCardMonitorStatus(symbol, m) {
   }
 }
 
-/* ===== Price Polling (مستقل) ===== */
+/* ===== Price Polling ===== */
 async function pollPrices() {
   for (const card of scanCards) {
     if (deletedSymbols.has(card.symbol)) continue;
+    if (!VALID_COLORS.includes(card.card?.color)) continue;
     try {
       const r = await fetch(`${API_BASE}/api/price/${card.symbol}`);
       if (!r.ok) continue;
@@ -701,7 +706,10 @@ function startPricePolling() {
 (function init() {
   scanCards = loadCards();
   loadDeleted();
-  scanCards = scanCards.filter(c => !deletedSymbols.has(c.symbol));
+  scanCards = scanCards
+    .filter(c => !deletedSymbols.has(c.symbol))
+    .filter(c => VALID_COLORS.includes(c.card?.color));
+  saveCards();
   renderCards();
 
   if (scanCards.length > 0) {
