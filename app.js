@@ -1,5 +1,6 @@
 /* ============================================================
    app.js — Longbridge Scanner (النسخة النهائية + Gemini async)
+   + معالجة 404 (المسح فُقد بعد إعادة تشغيل السيرفر)
    ============================================================ */
 const API_BASE = window.location.origin;
 
@@ -11,11 +12,13 @@ let pricePollTimer = null;
 let lastAlertedState = {};
 let deletedSymbols = new Set();
 
-// ✅ منع تكرار طلب Gemini لنفس السهم
 const aiRequested = new Set();
-// ✅ قائمة انتظار طلبات Gemini
 const aiQueue = [];
 let aiQueueRunning = false;
+
+// ✅ عدّاد فشل polling — إذا فشل 3 مرات، نتوقف
+let pollFailures = 0;
+const MAX_POLL_FAILURES = 3;
 
 const VALID_COLORS = ["green", "red"];
 const DEAD_STATUSES = ["stop_hit", "target_hit", "expired"];
@@ -150,9 +153,7 @@ function monitorStatusLabel(s) {
   return { label: "", cls: "" };
 }
 
-/* ============================================================
-   ✅ Gemini — طلب التحليل بعد عرض البطاقة (Async)
-   ============================================================ */
+/* ===== Gemini Queue ===== */
 function enqueueAIRequest(symbol) {
   if (!symbol || aiRequested.has(symbol)) return;
   aiRequested.add(symbol);
@@ -181,7 +182,7 @@ async function runAIQueue() {
           }
         }
       }
-    } catch (e) { /* تجاهل */ }
+    } catch (e) {}
     await new Promise(r => setTimeout(r, 800));
   }
   aiQueueRunning = false;
@@ -636,10 +637,10 @@ async function startScan() {
   scanBtn.disabled = true;
   scanBtn.querySelector(".scan-btn-text").textContent = "جاري المسح...";
 
-  // ✅ إصلاح جوهري: مسح جديد = تجاهل الحذف اليدوي القديم
-  // لأن قرار الحذف كان على نتيجة مسح قديمة، ولا معنى له مع نتائج جديدة
+  // ✅ تنظيف الحذف القديم
   deletedSymbols.clear();
   saveDeleted();
+  pollFailures = 0;
 
   progressWrap.style.display = "block";
   progressFill.style.width = "0%";
@@ -699,12 +700,40 @@ function mergeScanResults(newResults) {
   renderCards();
 }
 
+/* ===== ✅ معالجة 404 + فشل الشبكة ===== */
 async function pollScanProgress() {
   if (!currentScan) return;
 
+  let r;
   try {
-    const r = await fetch(`${API_BASE}/api/scan/${currentScan.scan_id}`);
-    if (!r.ok) return;
+    r = await fetch(`${API_BASE}/api/scan/${currentScan.scan_id}`);
+  } catch (e) {
+    // خطأ شبكة — أعِد المحاولة
+    pollFailures++;
+    if (pollFailures >= MAX_POLL_FAILURES) {
+      handleScanLost("⚠️ خطأ في الاتصال بالسيرفر. الرجاء إعادة المحاولة.");
+    }
+    return;
+  }
+
+  // ✅ 404 = المسح فُقد (إعادة تشغيل السيرفر)
+  if (r.status === 404) {
+    handleScanLost("⚠️ فقد الاتصال بالمسح (السيرفر أُعيد تشغيله). الرجاء إعادة المسح.");
+    return;
+  }
+
+  if (!r.ok) {
+    pollFailures++;
+    if (pollFailures >= MAX_POLL_FAILURES) {
+      handleScanLost("⚠️ فشل الاتصال بالمسح. الرجاء إعادة المحاولة.");
+    }
+    return;
+  }
+
+  // نجح — نصفّر العدّاد
+  pollFailures = 0;
+
+  try {
     const d = await r.json();
 
     const pct = (d.completed / d.total) * 100;
@@ -722,7 +751,35 @@ async function pollScanProgress() {
       progressWrap.style.display = d.status === "done" ? "none" : "block";
       startMonitoring();
     }
-  } catch (e) {}
+  } catch (e) {
+    pollFailures++;
+    if (pollFailures >= MAX_POLL_FAILURES) {
+      handleScanLost("⚠️ فشل قراءة بيانات المسح. الرجاء إعادة المحاولة.");
+    }
+  }
+}
+
+/* ===== ✅ معالجة فقدان المسح ===== */
+function handleScanLost(message) {
+  clearInterval(scanTimer);
+  scanTimer = null;
+  currentScan = null;
+  resetScanButton();
+  progressWrap.style.display = "none";
+  progressFill.style.width = "0%";
+
+  // إذا لا توجد بطاقات → أظهر الرسالة
+  const hasCards = scanCards.filter(c =>
+    VALID_COLORS.includes(c.card?.color) &&
+    !DEAD_STATUSES.includes(c.monitor_status)
+  ).length > 0;
+
+  if (!hasCards) {
+    emptyState.style.display = "block";
+    emptyState.innerHTML = `<p>${escapeHtml(message)}</p>`;
+  } else {
+    alert(message);
+  }
 }
 
 scanBtn.addEventListener("click", startScan);
