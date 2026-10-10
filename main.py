@@ -3,7 +3,10 @@ main.py — Longbridge Options Radar Scanner
 النسخة النهائية — 4 فريمات، مساران، حذف الرمادي نهائياً
 + توحيد صريح للأوقات
 + رفض الإشارات الميتة
-+ تحليل ذكي عبر Gemini (منفصل — لا يعطّل عرض البطاقة)
++ تحليل ذكي عبر Gemini (منفصل)
++ قائمة نظيفة: S&P 100 + Nasdaq 100 (ميجا + لارج كاب)
++ اختيار العقد: من الـ strikes الحقيقية، الأقرب لـ 2% OTM، مع تجربة بدائل
++ OI/Whales تُجلب دائماً (لا return مبكر)
 """
 import os
 import time
@@ -60,9 +63,11 @@ MAX_SPREAD  = 0.10
 DTE_MIN     = 5
 DTE_MAX     = 20
 DTE_TARGET  = 10
-OTM_MIN_PCT = 0.005
-OTM_MAX_PCT = 0.04
-OTM_TARGET  = 0.02
+OTM_TARGET  = 0.02          # الهدف: 2% OTM
+MAX_CANDIDATES = 10         # كم strike نجرّب قبل الاستسلام
+
+# ✅ فلتر السعر الأدنى
+MIN_PRICE = 50.0
 
 # ✅ Cache
 _candle_cache: dict[str, tuple[float, list]] = {}
@@ -83,56 +88,87 @@ DEAD_STATUSES = ("stop_hit", "target_hit", "expired")
 
 _TF_SECONDS = {"1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800}
 
+# ============================================================
+# ✅ قائمة نظيفة: S&P 100 + Nasdaq 100 (ميجا + لارج كاب)
+# ============================================================
 SCAN_SYMBOLS = list(dict.fromkeys([
-    "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "NVDA", "META", "BRK-B", "TSLA", "AVGO",
-    "WMT", "LLY", "JPM", "V", "UNH", "XOM", "MA", "ORCL", "COST", "HD",
-    "PG", "JNJ", "NFLX", "ABBV", "BAC", "CRM", "TMUS", "CVX", "AMD", "KO",
-    "PEP", "TMO", "LIN", "WFC", "ADBE", "MRK", "DIS", "ACN", "CSCO", "ABT",
-    "MCD", "INTU", "VZ", "QCOM", "GE", "TXN", "DHR", "IBM", "CAT", "AXP",
-    "AMGN", "NOW", "PM", "NEE", "PFE", "RTX", "SPGI", "UNP", "UBER", "GS",
-    "HON", "ISRG", "T", "LOW", "ELV", "SYK", "BKNG", "BLK", "ETN", "VRTX",
-    "C", "TJX", "MDT", "REGN", "BA", "PLD", "MMC", "CB", "SCHW", "ADP",
-    "BSX", "CI", "DE", "ADI", "LMT", "MDLZ", "FI", "BMY", "SO", "CVS",
-    "AMAT", "SBUX", "GILD", "PANW", "KLAC", "LRCX", "INTC", "PGR",
-    "PLTR", "SHOP", "SNOW", "DDOG", "CRWD", "ZS", "NET", "MDB", "TEAM", "WDAY",
-    "ADSK", "CDNS", "SNPS", "ANSS", "FTNT", "OKTA", "DOCU", "TWLO", "HUBS", "ZM",
-    "SQ", "PYPL", "COIN", "HOOD", "SOFI", "AFRM", "MRVL", "NXPI", "MCHP", "ON",
-    "WDC", "STX", "DELL", "HPQ", "HPE", "NTAP", "SMCI", "ARM", "TER", "ROP",
-    "TYL", "PTC", "VRSN", "CTSH", "INFY", "WIT", "EPAM", "GLOB", "FIS", "SSNC",
-    "JKHY", "FFIV", "AKAM", "JNPR", "MSI", "APH", "TEL", "GLW", "KEYS",
-    "HUM", "HCA", "MCK", "ABC", "CAH", "DGX", "LH", "BAX", "BDX", "BIIB",
-    "ILMN", "IDXX", "A", "MTD", "WAT", "RMD", "HOLX", "COO", "EW", "DXCM",
-    "PODD", "ALGN", "ZBH", "TFX", "STE", "XRAY", "ALC", "CRL", "IQV",
-    "PKI", "RVTY", "BIO", "TECH", "QGEN", "MOH", "CNC", "ALHC", "OSCR",
-    "CLOV", "HIMS", "DOCS", "VEEV", "TDOC", "AMWL", "ONEM", "PHR", "HCTI", "CERT",
-    "EVH", "PGNY", "ACCD", "GDRX", "HNGR",
-    "USB", "PNC", "TFC", "MTB", "FITB", "HBAN", "RF", "KEY", "CFG", "STT",
-    "BK", "NTRS", "MS", "PRU", "MET", "AFL", "ALL", "TRV", "AIG", "AJG",
-    "AON", "MCO", "ICE", "CME", "NDAQ", "CBOE", "MSCI", "MKTX", "TW", "CINF",
-    "WRB", "L", "RE", "GL", "CNA", "HIG", "ACGL", "EG", "AIZ", "SYF",
-    "DFS", "ALLY", "COF", "BX", "KKR", "APO", "ARES", "OWL", "TPG", "CG",
-    "TGT", "KR", "SYY", "ADM", "GIS", "K", "HSY", "MKC", "CL", "KMB",
-    "CHD", "EL", "YUM", "CMG", "DPZ", "WEN", "QSR", "DKNG", "MAR", "HLT",
-    "H", "RCL", "CCL", "NCLH", "LUV", "DAL", "AAL", "UAL", "F", "GM",
-    "RIVN", "LCID", "NIO", "XPEV", "LI", "TM", "HMC", "STLA", "RACE", "APTV",
-    "BWA", "LEA", "MGA", "ALV", "TSCO", "ORLY", "AZO", "AAP", "GPC", "LKQ",
-    "ULTA", "BBY", "DKS", "ROST", "BURL", "M", "JWN", "KSS", "GPS", "ANF",
-    "AEO", "URBN", "PLCE", "BJ", "PSMT", "DLTR", "DG", "FIVE", "OLLI", "BIG",
-    "WBA",
-    "CMI", "PCAR", "MMM", "EMR", "PH", "ROK", "DOV", "IR", "ITW", "CSX",
-    "NSC", "UPS", "FDX", "GD", "NOC", "LHX", "HII", "TDG", "HEI", "TXT",
-    "AXON", "WM", "RSG", "CWST", "SRCL", "CLH", "ECOL", "USX", "SAIA", "ODFL",
-    "XPO", "CHRW", "EXPD", "HUBG", "LSTR", "JBHT", "KNX", "WERN", "SNDR", "ARCB",
-    "MRTN", "GWW", "FAST", "POOL", "WSO", "BECN", "BLDR", "UFPI", "BCC", "LPX",
-    "MAS", "GEV", "VRT", "GNRC", "PWR", "AME",
-    "COP", "EOG", "PXD", "DVN", "OXY", "HAL", "SLB", "BKR", "PSX", "VLO",
-    "MPC", "KMI", "WMB", "OKE", "ET", "EPD", "PAA", "TRGP", "HES", "MRO",
-    "APA", "CTRA", "FANG", "HESM", "DINO", "PBF", "DK", "PARR",
-    "CMCSA", "CHTR", "WBD", "PARA", "FOXA", "DUK", "D", "AEP", "EXC", "XEL",
-    "SRE", "PEG", "ED", "WEC", "ES", "AEE", "DTE", "PPL", "FE", "ETR",
-    "CMS", "CNP", "NI", "AES", "NRG", "VST", "CEG", "PSEG", "PNW", "LNT",
-    "EVRG", "OGE", "PCG", "EIX", "AWK", "WTRG", "SJW", "CWT", "MSEX", "YORW",
-    "ARTNA",
+    # ── التكنولوجيا ──
+    "AAPL", "MSFT", "NVDA", "GOOGL", "GOOG", "AMZN", "META", "AVGO",
+    "TSLA", "ORCL", "CRM", "ADBE", "AMD", "INTC", "QCOM", "TXN",
+    "CSCO", "IBM", "NOW", "INTU", "AMAT", "MU", "LRCX", "KLAC",
+    "SNPS", "CDNS", "ANSS", "FTNT", "PANW", "CRWD", "DDOG", "ZS",
+    "NET", "MDB", "TEAM", "WDAY", "ADSK", "ROP", "APH", "MSI",
+    "TEL", "GLW", "KEYS", "HPQ", "DELL", "WDC", "STX", "NTAP",
+    "SMCI", "ARM", "TER", "NXPI", "MCHP", "ON", "SWKS", "QRVO",
+    "MPWR", "ENPH", "FSLR", "SNOW", "PLTR", "SHOP", "UBER", "LYFT",
+    "ABNB", "DASH", "COIN", "PYPL", "SQ", "HOOD", "SOFI", "AFRM",
+    "MRVL", "ADI", "MSCI", "FIS", "FI", "GPN", "JKHY", "FFIV",
+    "AKAM", "JNPR", "VRSN", "CTSH", "INFY", "WIT", "EPAM", "GLOB",
+    "SSNC", "TYL", "PTC",
+
+    # ── الاتصالات والإعلام ──
+    "NFLX", "DIS", "CMCSA", "CHTR", "TMUS", "VZ", "T", "EA",
+    "TTWO", "RBLX", "PARA", "WBD", "FOXA", "FOX",
+
+    # ── البنوك والمالية ──
+    "JPM", "BAC", "WFC", "C", "GS", "MS", "SCHW", "BLK", "BX",
+    "KKR", "APO", "ARES", "OWL", "TPG", "CG", "USB", "PNC", "TFC",
+    "MTB", "FITB", "HBAN", "RF", "KEY", "CFG", "STT", "BK",
+    "NTRS", "PRU", "MET", "AFL", "ALL", "TRV", "AIG", "AJG",
+    "AON", "MCO", "ICE", "CME", "NDAQ", "CBOE", "MKTX", "TW",
+    "CINF", "WRB", "L", "RE", "GL", "CNA", "HIG", "ACGL", "EG",
+    "AIZ", "SYF", "DFS", "ALLY", "COF", "AXP", "V", "MA",
+
+    # ── الطاقة ──
+    "XOM", "CVX", "COP", "EOG", "PXD", "DVN", "OXY", "HAL", "SLB",
+    "BKR", "PSX", "VLO", "MPC", "KMI", "WMB", "OKE", "ET", "EPD",
+    "PAA", "TRGP", "HES", "MRO", "APA", "CTRA", "FANG", "HESM",
+    "DINO", "PBF", "DK", "PARR",
+
+    # ── الرعاية الصحية ──
+    "LLY", "UNH", "JNJ", "ABBV", "MRK", "PFE", "TMO", "ABT",
+    "DHR", "BMY", "AMGN", "GILD", "VRTX", "REGN", "BIIB", "ILMN",
+    "IDXX", "A", "MTD", "WAT", "RMD", "HOLX", "COO", "EW",
+    "DXCM", "PODD", "ALGN", "ZBH", "TFX", "STE", "XRAY", "ALC",
+    "CRL", "IQV", "PKI", "RVTY", "BIO", "TECH", "QGEN", "HUM",
+    "HCA", "MCK", "ABC", "CAH", "DGX", "LH", "BAX", "BDX",
+    "CI", "ELV", "CVS", "MOH", "CNC", "VEEV", "DOCS",
+
+    # ── الاستهلاك ──
+    "WMT", "COST", "HD", "LOW", "TGT", "KR", "SYY", "ADM",
+    "GIS", "K", "HSY", "MKC", "CL", "KMB", "CHD", "EL",
+    "YUM", "CMG", "DPZ", "WEN", "QSR", "DKNG", "MAR", "HLT",
+    "H", "RCL", "CCL", "NCLH", "LUV", "DAL", "AAL", "UAL",
+    "PG", "PEP", "KO", "MDLZ", "STZ", "TAP", "KHC",
+
+    # ── التجزئة ──
+    "ORLY", "AZO", "AAP", "GPC", "LKQ", "ULTA", "BBY", "DKS",
+    "ROST", "BURL", "M",
+
+    # ── الصناعة ──
+    "GE", "BA", "CAT", "DE", "MMM", "HON", "LMT", "RTX", "GD",
+    "NOC", "LHX", "HII", "TDG", "HEI", "TXT", "AXON", "WM",
+    "RSG", "CMI", "PCAR", "EMR", "PH", "ROK", "DOV", "IR",
+    "ITW", "ETN", "AME", "PWR", "GNRC", "VRT", "GEV",
+
+    # ── النقل ──
+    "UNP", "CSX", "NSC", "UPS", "FDX", "ODFL", "XPO", "CHRW",
+    "EXPD", "JBHT", "KNX",
+
+    # ── المرافق ──
+    "NEE", "DUK", "SO", "D", "AEP", "EXC", "XEL", "SRE", "PEG",
+    "ED", "WEC", "ES", "AEE", "DTE", "PPL", "FE", "ETR", "CMS",
+    "CNP", "NI", "AES", "NRG", "VST", "CEG", "PSEG", "PNW",
+    "LNT", "EVRG", "OGE", "PCG", "EIX", "AWK", "WTRG",
+
+    # ── مواد ──
+    "LIN", "APD", "SHW", "ECL", "NEM", "FCX", "NUE", "STLD",
+    "DOW", "LYB", "PPG", "IFF", "ALB", "CE", "DD", "VMC",
+    "MLM", "IP", "PKG",
+
+    # ── عقارات ──
+    "PLD", "AMT", "EQIX", "CCI", "PSA", "O", "SPG", "VICI",
+    "WELL", "DLR", "AVB", "EQR", "MAA", "ESS", "UDR", "CPT",
 ]))
 
 _scans: dict[str, dict] = {}
@@ -168,7 +204,7 @@ def send_telegram_alert(message: str) -> bool:
 
 
 # ============================================================
-# Gemini — تحليل ذكي (يُستدعى عبر endpoint منفصل)
+# Gemini
 # ============================================================
 def _build_ai_prompt(data: dict) -> str:
     sym = data.get("symbol", "")
@@ -400,19 +436,58 @@ def _empty_option_result():
     }
 
 
-def _pick_strike(candidates, price, target_pct, is_call):
-    if not candidates:
+def _quote_one(ctx, sym_opt):
+    """يجلب اقتباس عقد واحد، يعيد dict أو None."""
+    try:
+        oqs = ctx.option_quote([sym_opt])
+        if not oqs:
+            return None
+        oq = oqs[0]
+        last = None
+        for attr in ("last_done", "last", "price"):
+            v = getattr(oq, attr, None)
+            if v is not None:
+                try:
+                    last = float(v); break
+                except (TypeError, ValueError):
+                    continue
+        bid = float(getattr(oq, "bid", 0) or 0)
+        ask = float(getattr(oq, "ask", 0) or 0)
+        return {"last": last, "bid": bid, "ask": ask, "raw": oq}
+    except Exception:
         return None
-    target_price = price * (1 + target_pct) if is_call else price * (1 - target_pct)
-    lo = price * (1 + OTM_MIN_PCT) if is_call else price * (1 - OTM_MAX_PCT)
-    hi = price * (1 + OTM_MAX_PCT) if is_call else price * (1 - OTM_MIN_PCT)
-    in_range = [c for c in candidates if lo <= _strike_of(c) <= hi]
-    if not in_range:
-        return None
-    return min(in_range, key=lambda c: abs(_strike_of(c) - target_price))
+
+
+def _try_strike(ctx, opt_sym):
+    """يجرّب عقداً واحداً، يعيد (pass, premium, spread, delta, reason)."""
+    if not opt_sym:
+        return False, None, None, None, "no_symbol"
+    q = _quote_one(ctx, opt_sym)
+    if not q:
+        return False, None, None, None, "no_quote"
+    last = q["last"]; ask = q["ask"]; bid = q["bid"]
+    spread = (ask - bid) if ask > bid > 0 else 999
+    entry = ask if ask > 0 else last
+    delta = None
+    if hasattr(q["raw"], "delta"):
+        try: delta = round(float(q["raw"].delta), 3)
+        except Exception: pass
+    if entry is None:
+        return False, None, spread, delta, "no_premium"
+    if entry > MAX_PREMIUM:
+        return False, round(entry, 2), spread, delta, "premium_too_high"
+    if spread > MAX_SPREAD:
+        return False, round(entry, 2), spread, delta, "spread_too_wide"
+    return True, round(entry, 2), spread, delta, "ok"
 
 
 def fetch_option_data(symbol, direction, price, strategy="swing"):
+    """
+    يجلب بيانات الخيارات:
+    - يجرّب أقرب الـ strikes الحقيقية للهدف (2% OTM)
+    - يقبل أول عقد يستوفي الفلاتر (سعر + سبريد)
+    - يجلب OI/Whales دائماً (بغض النظر عن نجاح العقد)
+    """
     ctx = get_ctx()
     sym = norm(symbol)
     result = _empty_option_result()
@@ -460,81 +535,75 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
             return f"{prefix}P{str(int(round(sk * 1000))).zfill(8)}.US"
 
         is_call = (direction == "bullish")
+        target_price = price * (1 + OTM_TARGET) if is_call else price * (1 - OTM_TARGET)
 
+        # ✅ 1) اجمع كل الـ strikes الحقيقية
         if is_call:
             cands = [c for c in chain if _call_of(c) and _strike_of(c) > price]
-            if not cands:
-                result["filter_reason"] = "no_call_strike"
-                return result
-            best = _pick_strike(cands, price, OTM_TARGET, True)
-            if best is None:
-                result["filter_reason"] = "no_call_strike"
-                return result
-            option_symbol = _call_of(best); strike = _strike_of(best); opt_type = "C"
         else:
             cands = [c for c in chain if _put_of(c) and _strike_of(c) < price]
-            if not cands:
-                result["filter_reason"] = "no_put_strike"
-                return result
-            best = _pick_strike(cands, price, OTM_TARGET, False)
-            if best is None:
-                result["filter_reason"] = "no_put_strike"
-                return result
-            option_symbol = _put_of(best); strike = _strike_of(best); opt_type = "P"
 
-        result["strike"] = f"{opt_type} {int(strike)}"
+        if not cands:
+            result["filter_reason"] = "no_call_strike" if is_call else "no_put_strike"
+            # ⚠️ نكمل لجلب OI/Whales — لا نتوقف
+        else:
+            # ✅ 2) رتّب بالأقرب للهدف
+            cands.sort(key=lambda c: abs(_strike_of(c) - target_price))
 
-        try:
-            oqs = ctx.option_quote([option_symbol])
-            if oqs:
-                oq = oqs[0]
-                last = None
-                for attr in ("last_done", "last", "price"):
-                    v = getattr(oq, attr, None)
-                    if v is not None:
-                        try:
-                            last = float(v); break
-                        except (TypeError, ValueError):
-                            continue
-                bid = float(getattr(oq, "bid", 0) or 0)
-                ask = float(getattr(oq, "ask", 0) or 0)
-                spread = (ask - bid) if ask > bid > 0 else 999
-                entry_premium = ask if ask > 0 else last
-                if entry_premium is not None:
-                    result["premium"] = round(entry_premium, 2)
-                if entry_premium is None:
-                    result["filter_reason"] = "no_premium"
-                elif entry_premium > MAX_PREMIUM:
-                    result["filter_reason"] = f"premium_too_high ({entry_premium})"
-                elif spread > MAX_SPREAD:
-                    result["filter_reason"] = f"spread_too_wide ({spread:.2f})"
-                else:
+            # ✅ 3) جرّب كل مرشح حتى نجد عقداً مقبولاً
+            chosen = None
+            for c in cands[:MAX_CANDIDATES]:
+                sk = _strike_of(c)
+                opt_sym = _call_of(c) if is_call else _put_of(c)
+                if not opt_sym:
+                    continue
+                ok, prem, spread, delta, reason = _try_strike(ctx, opt_sym)
+                if ok:
+                    chosen = {"strike": sk, "sym": opt_sym,
+                              "premium": prem, "delta": delta}
                     result["filter_pass"] = True
-                if hasattr(oq, "delta"):
-                    result["delta"] = round(float(oq.delta), 3)
-        except Exception as e:
-            result["filter_reason"] = f"quote_error: {e}"
+                    break
+                else:
+                    # سجّل آخر سبب فشل
+                    result["filter_reason"] = f"{reason} @ {int(sk)}"
 
-        calls_above = sorted(
-            [c for c in chain if _strike_of(c) > price and _call_of(c)],
-            key=lambda c: _strike_of(c))[:NEARBY_STRIKES]
-        puts_below = sorted(
-            [c for c in chain if _strike_of(c) < price and _put_of(c)],
-            key=lambda c: -_strike_of(c))[:NEARBY_STRIKES]
+            if chosen:
+                result["strike"] = f"{'C' if is_call else 'P'} {int(chosen['strike'])}"
+                result["premium"] = chosen["premium"]
+                if chosen["delta"] is not None:
+                    result["delta"] = chosen["delta"]
+                # احتفظ بالرمز لاستخدامه لاحقاً في التحليل
+                result["_opt_sym"] = chosen["sym"]
+            else:
+                # لم نجد عقداً مقبولاً — لكن نكمل
+                result["filter_reason"] = result["filter_reason"] or "no_suitable_contract"
 
+        # ✅ 4) اجلب OI/Volume/Whales دائماً
         strikes_map = {}
-        for c in calls_above:
+        for c in chain:
             sk = _strike_of(c)
-            strikes_map.setdefault(sk, [None, None])[0] = _call_of(c) or build_call_sym(sk)
-        for c in puts_below:
-            sk = _strike_of(c)
-            strikes_map.setdefault(sk, [None, None])[1] = _put_of(c) or build_put_sym(sk)
+            if sk <= 0:
+                continue
+            cs = _call_of(c) or build_call_sym(sk)
+            ps = _put_of(c)  or build_put_sym(sk)
+            strikes_map[sk] = (cs, ps)
 
-        all_call_syms = [v[0] for v in strikes_map.values() if v[0]]
-        all_put_syms  = [v[1] for v in strikes_map.values() if v[1]]
+        # للعرض: 5 CALL فوق السعر + 5 PUT تحت السعر
+        calls_above = sorted([s for s in strikes_map.keys() if s > price])[:NEARBY_STRIKES]
+        puts_below  = sorted([s for s in strikes_map.keys() if s < price],
+                              reverse=True)[:NEARBY_STRIKES]
 
+        display_strikes = sorted(set(calls_above + puts_below))
+
+        # اجمع كل الرموز المطلوبة
+        all_syms_set = set()
+        for sk in display_strikes:
+            cs, ps = strikes_map.get(sk, (None, None))
+            if cs: all_syms_set.add(cs)
+            if ps: all_syms_set.add(ps)
+
+        all_syms = list(all_syms_set)
         qmap = {}
-        all_syms = list(set(all_call_syms + all_put_syms))
         for i in range(0, len(all_syms), OPTION_QUOTE_BATCH):
             try:
                 qs = ctx.option_quote(all_syms[i:i+OPTION_QUOTE_BATCH])
@@ -542,42 +611,43 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
                     for q in qs: qmap[q.symbol] = q
             except Exception: pass
 
+        # إجماليات CALL / PUT (من عيّنة العرض)
         tc_oi = tp_oi = tc_v = tp_v = 0
-        for s in all_call_syms:
-            if s in qmap:
-                q = qmap[s]
-                tc_oi += int(getattr(q, "open_interest", 0) or 0)
-                tc_v  += int(getattr(q, "volume", 0) or 0)
-        for s in all_put_syms:
-            if s in qmap:
-                q = qmap[s]
-                tp_oi += int(getattr(q, "open_interest", 0) or 0)
-                tp_v  += int(getattr(q, "volume", 0) or 0)
-
-        result["total_call_oi"] = tc_oi
-        result["total_put_oi"]  = tp_oi
-        result["total_call_vol"] = tc_v
-        result["total_put_vol"]  = tp_v
-
         cd = []
-        for sk, (cs, _) in sorted(strikes_map.items(), reverse=True):
+        for sk in sorted(display_strikes, reverse=True):
+            cs, ps = strikes_map.get(sk, (None, None))
             if cs and cs in qmap:
                 q = qmap[cs]
-                cd.append({"strike": int(sk),
-                           "oi": int(getattr(q, "open_interest", 0) or 0),
-                           "volume": int(getattr(q, "volume", 0) or 0)})
+                oi = int(getattr(q, "open_interest", 0) or 0)
+                vol = int(getattr(q, "volume", 0) or 0)
+                tc_oi += oi; tc_v += vol
+                cd.append({"strike": int(sk), "oi": oi, "volume": vol})
+            if ps and ps in qmap:
+                q = qmap[ps]
+                oi = int(getattr(q, "open_interest", 0) or 0)
+                vol = int(getattr(q, "volume", 0) or 0)
+                tp_oi += oi; tp_v += vol
+
         pd_ = []
-        for sk, (_, ps) in sorted(strikes_map.items(), reverse=True):
+        for sk in sorted(display_strikes, reverse=True):
+            cs, ps = strikes_map.get(sk, (None, None))
             if ps and ps in qmap:
                 q = qmap[ps]
                 pd_.append({"strike": int(sk),
                             "oi": int(getattr(q, "open_interest", 0) or 0),
                             "volume": int(getattr(q, "volume", 0) or 0)})
+
+        result["total_call_oi"]  = tc_oi
+        result["total_put_oi"]   = tp_oi
+        result["total_call_vol"] = tc_v
+        result["total_put_vol"]  = tp_v
         result["call_oi"] = cd
         result["put_oi"]  = pd_
 
+        # الحيتان
         whales = []
-        for sk, (cs, ps) in strikes_map.items():
+        for sk in display_strikes:
+            cs, ps = strikes_map.get(sk, (None, None))
             for sym_opt, tp_ in ((cs, "CALL"), (ps, "PUT")):
                 if not sym_opt or sym_opt not in qmap: continue
                 q = qmap[sym_opt]
@@ -601,6 +671,8 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
     except Exception as e:
         print(f"[OPT] {symbol} {e}", flush=True)
         result["filter_reason"] = f"exception: {e}"
+
+    result.pop("_opt_sym", None)
     return result
 
 
@@ -633,17 +705,21 @@ def _is_dead_signal(scan: dict, price: float) -> bool:
 
 
 # ============================================================
-# analyze_symbol — بدون Gemini (سريع، يعيد البطاقة كاملة فوراً)
+# analyze_symbol — مع فلتر السعر
 # ============================================================
 def analyze_symbol(symbol: str) -> dict:
+    q = get_ctx().quote([norm(symbol)])[0]
+    price = float(q.last_done)
+    prev_close = float(q.prev_close)
+
+    # ✅ رفض الأسهم الرخيصة (قبل جلب الشموع — توفير كبير)
+    if price < MIN_PRICE:
+        return _gray_result(symbol, price)
+
     df_weekly = candles_to_df(fetch_candles(symbol, "1w", 150), "1w")
     df_daily  = candles_to_df(fetch_candles(symbol, "1d", 400), "1d")
     df_4h     = candles_to_df(fetch_candles(symbol, "4h", 200), "4h")
     df_1h     = candles_to_df(fetch_candles(symbol, "1h", 200), "1h")
-
-    q = get_ctx().quote([norm(symbol)])[0]
-    price = float(q.last_done)
-    prev_close = float(q.prev_close)
 
     scan = scan_setup(df_weekly, df_daily, df_4h, df_1h)
 
@@ -880,6 +956,7 @@ async def lifespan(app: FastAPI):
         ctx = get_ctx()
         ctx.set_on_quote(_on_quote)
         print("[STARTUP] ready", flush=True)
+        print(f"[STARTUP] symbols={len(SCAN_SYMBOLS)} min_price=${MIN_PRICE}", flush=True)
         if GEMINI_API_KEY:
             print(f"[STARTUP] Gemini enabled — models: {GEMINI_MODELS}", flush=True)
         else:
@@ -958,13 +1035,8 @@ def test_gemini():
     return {"ok": bool(text), "text": text, "models_tried": GEMINI_MODELS}
 
 
-# ✅ نقطة API جديدة — تحليل Gemini لسهم واحد (منفصل عن المسح)
 @app.get("/api/ai/{symbol}")
 async def ai_analysis(symbol: str):
-    """
-    يُستدعى من الواجهة بعد عرض البطاقة.
-    يعتمد على الكاش (analyze_cached) — لا يعيد جلب الشموع إن كانت حديثة.
-    """
     if not GEMINI_API_KEY:
         return {"ok": False, "reason": "no_key"}
     sym = symbol.upper().strip()
@@ -1087,6 +1159,9 @@ def cache_stats():
         "ai_cache_size": len(_ai_cache),
         "monitoring_count": len(_monitoring),
         "symbols_total": len(SCAN_SYMBOLS),
+        "min_price": MIN_PRICE,
+        "max_premium": MAX_PREMIUM,
+        "max_spread": MAX_SPREAD,
         "gemini_enabled": bool(GEMINI_API_KEY),
         "gemini_models": GEMINI_MODELS,
     }
