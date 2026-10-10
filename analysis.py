@@ -5,9 +5,16 @@ analysis.py — استراتيجية الاختراق وإعادة الاختب�
 ⚠️ عقد البيانات:
 - المستدعي (main.py) يجب أن يُنشئ عمودين:
     * time       = وقت بداية الشمعة (من مزود البيانات، للعرض فقط).
-    * close_time = وقت إغلاق الشمعة (لحظة توفر المعلومة).
+    * close_time = وقت إغلاق الشمعة (لحظة توفر المعلومة) بتوقيت UTC.
 - المنطق يستخدم close_time حصراً — لا fallback على time.
 - المستدعي يجب أن يمرر شموعاً مكتملة فقط (main.py يستبعد غير المكتملة).
+
+⚠️ تحديد المستويات (إصلاح جوهري):
+- "قمة/قاع الأسبوع السابق": تُحدد زمنياً — آخر شمعة أسبوعية مُكتملة
+  في الأسبوع التقويمي السابق (بتوقيت نيويورك).
+- "قمة/قاع أمس": تُحدد زمنياً — آخر شمعة يومية مُكتملة قبل بداية
+  اليوم الحالي (بتوقيت نيويورك).
+- لا يعتمد على الموضع (-1/-2) لأن ذلك يُنتج قمة/قاع خاطئة حسب يوم الأسبوع.
 """
 from __future__ import annotations
 
@@ -19,8 +26,8 @@ import pandas as pd
 MIN_RVOL = 1.5
 MIN_RR = 2.0
 MAX_RETEST_CANDLES = 5
-MAX_FIRST_CANDLE_WINDOW = 5       # أول تأكيد خلال 5 شموع بعد Retest
-MAX_SECOND_CANDLE_WINDOW = 5      # الشمعة الثانية خلال 5 شموع بعد الأولى
+MAX_FIRST_CANDLE_WINDOW = 5
+MAX_SECOND_CANDLE_WINDOW = 5
 MAX_1H_CONFIRM_CANDLES = 5
 BODY_RATIO_MIN = 0.6
 ATR_PERIOD = 14
@@ -29,6 +36,9 @@ TOLERANCE_PCT = 0.003
 TOLERANCE_ATR_MULT = 0.25
 BREAKOUT_LOOKBACK = 10
 RVOL_PERIOD = 20
+
+# السوق الأمريكي — توقيت نيويورك
+MARKET_TZ = "America/New_York"
 
 _REQUIRED_COLUMNS = {"open", "high", "low", "close", "volume"}
 _TIME_COLUMNS = {"time", "close_time"}
@@ -60,7 +70,7 @@ def _sorted_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _time_of(df: Optional[pd.DataFrame], pos: int):
-    """وقت الإغلاق للصف pos (يُستخدم كمرجع زمني في كل المنطق)."""
+    """وقت الإغلاق للصف pos (المرجع الزمني في كل المنطق)."""
     if df is None or "close_time" not in df.columns or pos < 0 or pos >= len(df):
         return None
     return df.iloc[pos]["close_time"]
@@ -100,6 +110,7 @@ def rvol_series(df: pd.DataFrame, n: int = RVOL_PERIOD) -> pd.Series:
 # أدوات عامة
 # ============================================================
 def prev_candle_hl(df: pd.DataFrame, idx: int = -2):
+    """high/low شمعة بموضع idx (يُستخدم لعرض الفريمات فقط)."""
     if not _valid_df(df) or len(df) < abs(idx):
         return None, None
     row = df.iloc[idx]
@@ -145,6 +156,74 @@ def compute_tolerance(level: float, atr_val: float) -> float:
     if not np.isfinite(level) or not np.isfinite(atr_val) or atr_val <= 0:
         return 0.0
     return min(abs(level) * TOLERANCE_PCT, atr_val * TOLERANCE_ATR_MULT)
+
+
+# ============================================================
+# تحديد المستويات زمنياً (إصلاح جوهري)
+# ============================================================
+def _now_market() -> pd.Timestamp:
+    """الوقت الحالي بتوقيت نيويورك (سوق الأسهم الأمريكي)."""
+    return pd.Timestamp.now(tz=MARKET_TZ)
+
+
+def get_prev_week_levels(df_weekly: pd.DataFrame,
+                         now_ny: Optional[pd.Timestamp] = None):
+    """
+    (high, low) لآخر شمعة أسبوعية مُكتملة في الأسبوع التقويمي السابق.
+    - start_of_this_week = الاثنين 00:00 (توقيت نيويورك) للأسبوع الحالي.
+    - نختار آخر شمعة close_time < start_of_this_week.
+    - هذا يعمل بثبات بغض النظر عن يوم الأسبوع.
+    """
+    if df_weekly is None or len(df_weekly) == 0 or "close_time" not in df_weekly.columns:
+        return None, None
+    if now_ny is None:
+        now_ny = _now_market()
+    try:
+        days_since_mon = int(now_ny.weekday())  # Monday=0
+        start_ny = (now_ny - pd.Timedelta(days=days_since_mon)).normalize()
+        start_utc = start_ny.tz_convert("UTC")
+    except Exception:
+        return None, None
+
+    try:
+        mask = df_weekly["close_time"] < start_utc
+    except TypeError:
+        # Fallback لو close_time غير aware
+        mask = df_weekly["close_time"] < start_utc.tz_localize(None)
+
+    sub = df_weekly[mask]
+    if sub.empty:
+        return None, None
+    row = sub.iloc[-1]
+    return float(row["high"]), float(row["low"])
+
+
+def get_prev_day_levels(df_daily: pd.DataFrame,
+                        now_ny: Optional[pd.Timestamp] = None):
+    """
+    (high, low) لآخر شمعة يومية مُكتملة قبل بداية اليوم الحالي (نيويورك).
+    - يعادل "أمس" بمعنى آخر جلسة تداول منتهية.
+    """
+    if df_daily is None or len(df_daily) == 0 or "close_time" not in df_daily.columns:
+        return None, None
+    if now_ny is None:
+        now_ny = _now_market()
+    try:
+        start_ny = now_ny.normalize()   # 00:00 توقيت نيويورك اليوم
+        start_utc = start_ny.tz_convert("UTC")
+    except Exception:
+        return None, None
+
+    try:
+        mask = df_daily["close_time"] < start_utc
+    except TypeError:
+        mask = df_daily["close_time"] < start_utc.tz_localize(None)
+
+    sub = df_daily[mask]
+    if sub.empty:
+        return None, None
+    row = sub.iloc[-1]
+    return float(row["high"]), float(row["low"])
 
 
 # ============================================================
@@ -413,6 +492,7 @@ def _build_result(direction, stage, entry, target1, target2, stop,
 
 
 def _tf_snapshot(df, label):
+    """لقطة فريم للعرض: high/low شمعة سابقة + سعر الإغلاق الأخير."""
     if not _valid_df(df) or len(df) < 5:
         return {"label": label, "support": None, "resistance": None,
                 "broke_resistance": False, "broke_support": False}
@@ -446,8 +526,11 @@ def scan_setup(df_weekly, df_daily, df_4h, df_1h):
 
     df_weekly, df_daily, df_4h, df_1h = [_sorted_df(d) for d in frames]
 
-    w_high, w_low = prev_candle_hl(df_weekly, -2)
-    d_high, d_low = prev_candle_hl(df_daily, -2)
+    # ✅ إصلاح جوهري: تحديد المستويات زمنياً، لا موضعياً
+    now_ny = _now_market()
+    w_high, w_low = get_prev_week_levels(df_weekly, now_ny)
+    d_high, d_low = get_prev_day_levels(df_daily, now_ny)
+
     sr_dict = {
         "weekly": {"support": round(w_low, 2) if w_low is not None else None,
                    "resistance": round(w_high, 2) if w_high is not None else None},
@@ -514,7 +597,6 @@ def scan_setup(df_weekly, df_daily, df_4h, df_1h):
         confirm_time = confirm.get("confirm_time")
         if confirm_time is None:
             continue
-        # افحص شموع 4H التي close_time <= وقت التأكيد
         eligible = np.flatnonzero(
             (df_4h["close_time"] <= pd.to_datetime(confirm_time, utc=True)).to_numpy()
         )
