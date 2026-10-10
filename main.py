@@ -4,10 +4,12 @@ main.py — Longbridge Options Radar Scanner
 + توحيد صريح للأوقات
 + رفض الإشارات الميتة
 + تحليل ذكي عبر Gemini (منفصل)
-+ قائمة نظيفة: S&P 100 + Nasdaq 100 (ميجا + لارج كاب)
-+ اختيار العقد: من الـ strikes الحقيقية، الأقرب لـ 2% OTM، مع تجربة بدائل
++ اختيار العقد: من الـ strikes الحقيقية، مع تجربة بدائل
 + OI/Whales تُجلب دائماً
-+ ✅ حماية من فشل quote (IndexError)
++ معالجة السوق المغلق (تخطي فلتر السبريد)
++ تسجيل أول سبب فشل
++ حد OTM أقصى 8%
++ SPY, QQQ, IWM, SPCX
 """
 import os
 import time
@@ -63,7 +65,10 @@ DTE_MIN     = 5
 DTE_MAX     = 20
 DTE_TARGET  = 10
 OTM_TARGET  = 0.02
+OTM_MAX     = 0.08
 MAX_CANDIDATES = 10
+
+CLOSED_MARKET_SPREAD_THRESHOLD = 0.50
 
 MIN_PRICE = 50.0
 
@@ -85,7 +90,14 @@ DEAD_STATUSES = ("stop_hit", "target_hit", "expired")
 
 _TF_SECONDS = {"1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800}
 
+# ============================================================
+# قائمة الأسهم + صناديق المؤشرات (SPX محذوف، SPCX مضاف)
+# ============================================================
 SCAN_SYMBOLS = list(dict.fromkeys([
+    # ── صناديق المؤشرات (ETFs) ──
+    "SPY", "QQQ", "IWM", "SPCX",
+
+    # ── التكنولوجيا ──
     "AAPL", "MSFT", "NVDA", "GOOGL", "GOOG", "AMZN", "META", "AVGO",
     "TSLA", "ORCL", "CRM", "ADBE", "AMD", "INTC", "QCOM", "TXN",
     "CSCO", "IBM", "NOW", "INTU", "AMAT", "MU", "LRCX", "KLAC",
@@ -98,8 +110,12 @@ SCAN_SYMBOLS = list(dict.fromkeys([
     "MRVL", "ADI", "MSCI", "FIS", "FI", "GPN", "JKHY", "FFIV",
     "AKAM", "JNPR", "VRSN", "CTSH", "INFY", "WIT", "EPAM", "GLOB",
     "SSNC", "TYL", "PTC",
+
+    # ── الاتصالات والإعلام ──
     "NFLX", "DIS", "CMCSA", "CHTR", "TMUS", "VZ", "T", "EA",
     "TTWO", "RBLX", "PARA", "WBD", "FOXA", "FOX",
+
+    # ── البنوك والمالية ──
     "JPM", "BAC", "WFC", "C", "GS", "MS", "SCHW", "BLK", "BX",
     "KKR", "APO", "ARES", "OWL", "TPG", "CG", "USB", "PNC", "TFC",
     "MTB", "FITB", "HBAN", "RF", "KEY", "CFG", "STT", "BK",
@@ -107,10 +123,14 @@ SCAN_SYMBOLS = list(dict.fromkeys([
     "AON", "MCO", "ICE", "CME", "NDAQ", "CBOE", "MKTX", "TW",
     "CINF", "WRB", "L", "RE", "GL", "CNA", "HIG", "ACGL", "EG",
     "AIZ", "SYF", "DFS", "ALLY", "COF", "AXP", "V", "MA",
+
+    # ── الطاقة ──
     "XOM", "CVX", "COP", "EOG", "PXD", "DVN", "OXY", "HAL", "SLB",
     "BKR", "PSX", "VLO", "MPC", "KMI", "WMB", "OKE", "ET", "EPD",
     "PAA", "TRGP", "HES", "MRO", "APA", "CTRA", "FANG", "HESM",
     "DINO", "PBF", "DK", "PARR",
+
+    # ── الرعاية الصحية ──
     "LLY", "UNH", "JNJ", "ABBV", "MRK", "PFE", "TMO", "ABT",
     "DHR", "BMY", "AMGN", "GILD", "VRTX", "REGN", "BIIB", "ILMN",
     "IDXX", "A", "MTD", "WAT", "RMD", "HOLX", "COO", "EW",
@@ -118,26 +138,40 @@ SCAN_SYMBOLS = list(dict.fromkeys([
     "CRL", "IQV", "PKI", "RVTY", "BIO", "TECH", "QGEN", "HUM",
     "HCA", "MCK", "ABC", "CAH", "DGX", "LH", "BAX", "BDX",
     "CI", "ELV", "CVS", "MOH", "CNC", "VEEV", "DOCS",
+
+    # ── الاستهلاك ──
     "WMT", "COST", "HD", "LOW", "TGT", "KR", "SYY", "ADM",
     "GIS", "K", "HSY", "MKC", "CL", "KMB", "CHD", "EL",
     "YUM", "CMG", "DPZ", "WEN", "QSR", "DKNG", "MAR", "HLT",
     "H", "RCL", "CCL", "NCLH", "LUV", "DAL", "AAL", "UAL",
     "PG", "PEP", "KO", "MDLZ", "STZ", "TAP", "KHC",
+
+    # ── التجزئة ──
     "ORLY", "AZO", "AAP", "GPC", "LKQ", "ULTA", "BBY", "DKS",
     "ROST", "BURL", "M",
+
+    # ── الصناعة ──
     "GE", "BA", "CAT", "DE", "MMM", "HON", "LMT", "RTX", "GD",
     "NOC", "LHX", "HII", "TDG", "HEI", "TXT", "AXON", "WM",
     "RSG", "CMI", "PCAR", "EMR", "PH", "ROK", "DOV", "IR",
     "ITW", "ETN", "AME", "PWR", "GNRC", "VRT", "GEV",
+
+    # ── النقل ──
     "UNP", "CSX", "NSC", "UPS", "FDX", "ODFL", "XPO", "CHRW",
     "EXPD", "JBHT", "KNX",
+
+    # ── المرافق ──
     "NEE", "DUK", "SO", "D", "AEP", "EXC", "XEL", "SRE", "PEG",
     "ED", "WEC", "ES", "AEE", "DTE", "PPL", "FE", "ETR", "CMS",
     "CNP", "NI", "AES", "NRG", "VST", "CEG", "PSEG", "PNW",
     "LNT", "EVRG", "OGE", "PCG", "EIX", "AWK", "WTRG",
+
+    # ── مواد ──
     "LIN", "APD", "SHW", "ECL", "NEM", "FCX", "NUE", "STLD",
     "DOW", "LYB", "PPG", "IFF", "ALB", "CE", "DD", "VMC",
     "MLM", "IP", "PKG",
+
+    # ── عقارات ──
     "PLD", "AMT", "EQIX", "CCI", "PSA", "O", "SPG", "VICI",
     "WELL", "DLR", "AVB", "EQR", "MAA", "ESS", "UDR", "CPT",
 ]))
@@ -160,9 +194,6 @@ def norm(symbol: str) -> str:
 
 
 def _safe_quote(symbol: str) -> tuple[float | None, float | None]:
-    """
-    ✅ حماية: يُرجع (price, prev_close) أو (None, None) إذا فشل.
-    """
     try:
         q_list = get_ctx().quote([norm(symbol)])
         if not q_list:
@@ -451,8 +482,11 @@ def _try_strike(ctx, opt_sym):
         return False, None, spread, delta, "no_premium"
     if entry > MAX_PREMIUM:
         return False, round(entry, 2), spread, delta, "premium_too_high"
-    if spread > MAX_SPREAD:
+
+    market_closed = (bid == 0 or ask == 0 or spread > CLOSED_MARKET_SPREAD_THRESHOLD)
+    if not market_closed and spread > MAX_SPREAD:
         return False, round(entry, 2), spread, delta, "spread_too_wide"
+
     return True, round(entry, 2), spread, delta, "ok"
 
 
@@ -507,15 +541,22 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
         target_price = price * (1 + OTM_TARGET) if is_call else price * (1 - OTM_TARGET)
 
         if is_call:
-            cands = [c for c in chain if _call_of(c) and _strike_of(c) > price]
+            lo = price * (1 + 0.005)
+            hi = price * (1 + OTM_MAX)
+            cands = [c for c in chain
+                     if _call_of(c) and lo <= _strike_of(c) <= hi]
         else:
-            cands = [c for c in chain if _put_of(c) and _strike_of(c) < price]
+            lo = price * (1 - OTM_MAX)
+            hi = price * (1 - 0.005)
+            cands = [c for c in chain
+                     if _put_of(c) and lo <= _strike_of(c) <= hi]
 
         if not cands:
-            result["filter_reason"] = "no_call_strike" if is_call else "no_put_strike"
+            result["filter_reason"] = "no_call_strike_in_range" if is_call else "no_put_strike_in_range"
         else:
             cands.sort(key=lambda c: abs(_strike_of(c) - target_price))
             chosen = None
+            first_failure_reason = None
             for c in cands[:MAX_CANDIDATES]:
                 sk = _strike_of(c)
                 opt_sym = _call_of(c) if is_call else _put_of(c)
@@ -528,16 +569,17 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
                     result["filter_pass"] = True
                     break
                 else:
-                    result["filter_reason"] = f"{reason} @ {int(sk)}"
+                    if first_failure_reason is None:
+                        first_failure_reason = f"{reason} @ {int(sk)}"
+
             if chosen:
                 result["strike"] = f"{'C' if is_call else 'P'} {int(chosen['strike'])}"
                 result["premium"] = chosen["premium"]
                 if chosen["delta"] is not None:
                     result["delta"] = chosen["delta"]
             else:
-                result["filter_reason"] = result["filter_reason"] or "no_suitable_contract"
+                result["filter_reason"] = first_failure_reason or "no_suitable_contract"
 
-        # OI/Whales دائماً
         strikes_map = {}
         for c in chain:
             sk = _strike_of(c)
@@ -629,9 +671,6 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
     return result
 
 
-# ============================================================
-# رفض الإشارات الميتة
-# ============================================================
 def _gray_result(symbol: str, price: float) -> dict:
     return {
         "symbol": symbol.upper(),
@@ -657,11 +696,7 @@ def _is_dead_signal(scan: dict, price: float) -> bool:
     return (price >= sp) or (price <= tp)
 
 
-# ============================================================
-# analyze_symbol
-# ============================================================
 def analyze_symbol(symbol: str) -> dict:
-    # ✅ حماية: إذا فشل quote → رمادي (وليس IndexError)
     price, prev_close = _safe_quote(symbol)
     if price is None:
         return _gray_result(symbol, 0.0)
@@ -758,9 +793,6 @@ def _purge_symbol_from_scans(symbol: str):
         scan["results"] = [r for r in results if r.get("symbol") != sym]
 
 
-# ============================================================
-# المسح
-# ============================================================
 async def analyze_one_safe(sym, semaphore):
     async with semaphore:
         try:
@@ -835,9 +867,6 @@ def cleanup_old_scans():
         _scans.pop(sid, None)
 
 
-# ============================================================
-# المراقبة
-# ============================================================
 async def monitor_task():
     await asyncio.sleep(60)
     while True:
@@ -902,9 +931,6 @@ async def monitor_task():
         await asyncio.sleep(MONITOR_INTERVAL)
 
 
-# ============================================================
-# FastAPI
-# ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _event_loop
@@ -1118,6 +1144,8 @@ def cache_stats():
         "min_price": MIN_PRICE,
         "max_premium": MAX_PREMIUM,
         "max_spread": MAX_SPREAD,
+        "otm_max": OTM_MAX,
+        "closed_market_spread_threshold": CLOSED_MARKET_SPREAD_THRESHOLD,
         "gemini_enabled": bool(GEMINI_API_KEY),
         "gemini_models": GEMINI_MODELS,
         "scans_in_memory": len(_scans),
