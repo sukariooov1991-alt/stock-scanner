@@ -1,6 +1,7 @@
 """
 main.py — Longbridge Options Radar Scanner
 النسخة النهائية — 4 فريمات، مساران، حذف الرمادي نهائياً
++ توحيد صريح للأوقات: time = بداية الشمعة، close_time = نهاية الشمعة
 """
 import os
 import time
@@ -63,6 +64,9 @@ NEARBY_STRIKES = 5
 OPTION_QUOTE_BATCH = 50
 
 VALID_COLORS = ("green", "red")
+
+# ثواني كل إطار (لحساب close_time من وقت البداية)
+_TF_SECONDS = {"1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800}
 
 SCAN_SYMBOLS = list(dict.fromkeys([
     "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "NVDA", "META", "BRK-B", "TSLA", "AVGO",
@@ -148,12 +152,54 @@ def send_telegram_alert(message: str) -> bool:
         return False
 
 
-def candles_to_df(candles):
+def candles_to_df(candles, timeframe=None):
+    """
+    تحويل الشموع إلى DataFrame بأوقات موحّدة صراحة:
+      - time:       وقت بداية الشمعة (من مزود البيانات).
+      - close_time: وقت إغلاق الشمعة (محسوب = البداية + مدة الإطار).
+    تُستبعد آخر شمعة إذا لم يكن وقت إغلاقها قد مضى بعد (لم تكتمل).
+    تُستبعد أيضاً أي شمعة أخرى لم يكتمل وقت إغلاقها (حماية إضافية).
+    """
     import pandas as pd
-    return pd.DataFrame([{
+    rows = [{
         "time": c.timestamp, "open": float(c.open), "high": float(c.high),
         "low": float(c.low), "close": float(c.close), "volume": int(c.volume),
-    } for c in candles])
+    } for c in candles]
+    df = pd.DataFrame(rows)
+    if df.empty or timeframe not in _TF_SECONDS or "time" not in df:
+        return df
+
+    seconds = _TF_SECONDS[timeframe]
+    try:
+        raw = df["time"]
+        if pd.api.types.is_numeric_dtype(raw):
+            starts = pd.to_datetime(raw, unit="s", utc=True)
+        else:
+            starts = pd.to_datetime(raw, utc=True)
+        closes = starts + pd.Timedelta(seconds=seconds)
+        now = pd.Timestamp.now(tz="UTC")
+
+        # استبعاد كل شمعة لم يكتمل وقت إغلاقها
+        mask = closes <= now
+        df = df.loc[mask].copy()
+        starts = starts.loc[mask]
+        closes = closes.loc[mask]
+
+        if df.empty:
+            return df.reset_index(drop=True)
+
+        # ✅ توحيد صريح للأعمدة
+        df["time"] = starts.values
+        df["close_time"] = closes.values
+    except Exception:
+        # fail-closed: نُسقط آخر شمعة عند أي فشل
+        df = df.iloc[:-1].copy()
+        try:
+            df["time"] = pd.to_datetime(df["time"], utc=True)
+            df["close_time"] = df["time"] + pd.Timedelta(seconds=seconds)
+        except Exception:
+            pass
+    return df.reset_index(drop=True)
 
 
 PERIOD_MAP = {
@@ -243,17 +289,16 @@ def _empty_option_result():
 
 
 def _pick_strike(candidates, price, target_pct, is_call):
-    """يختار أقرب strike للهدف ضمن النطاق [0.5%, 4%] OTM."""
     if not candidates:
         return None
     target_price = price * (1 + target_pct) if is_call else price * (1 - target_pct)
     lo = price * (1 + OTM_MIN_PCT) if is_call else price * (1 - OTM_MAX_PCT)
     hi = price * (1 + OTM_MAX_PCT) if is_call else price * (1 - OTM_MIN_PCT)
 
-    in_range = [c for c in candidates
-                if lo <= _strike_of(c) <= hi]
-    pool = in_range if in_range else candidates
-    return min(pool, key=lambda c: abs(_strike_of(c) - target_price))
+    in_range = [c for c in candidates if lo <= _strike_of(c) <= hi]
+    if not in_range:
+        return None
+    return min(in_range, key=lambda c: abs(_strike_of(c) - target_price))
 
 
 def fetch_option_data(symbol, direction, price, strategy="swing"):
@@ -279,8 +324,6 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
 
         valid = [(d, (d - today).days) for d in parsed
                  if DTE_MIN <= (d - today).days <= DTE_MAX]
-        if not valid:
-            valid = [(d, (d - today).days) for d in parsed]
         if not valid:
             result["filter_reason"] = "no_valid_expiry"
             return result
@@ -334,7 +377,6 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
 
         result["strike"] = f"{opt_type} {int(strike)}"
 
-        # فلتر العقد
         try:
             oqs = ctx.option_quote([option_symbol])
             if oqs:
@@ -343,18 +385,23 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
                 for attr in ("last_done", "last", "price"):
                     v = getattr(oq, attr, None)
                     if v is not None:
-                        last = float(v)
-                        result["premium"] = round(last, 2)
-                        break
+                        try:
+                            last = float(v)
+                            break
+                        except (TypeError, ValueError):
+                            continue
 
                 bid = float(getattr(oq, "bid", 0) or 0)
                 ask = float(getattr(oq, "ask", 0) or 0)
                 spread = (ask - bid) if ask > bid > 0 else 999
+                entry_premium = ask if ask > 0 else last
+                if entry_premium is not None:
+                    result["premium"] = round(entry_premium, 2)
 
-                if last is None:
+                if entry_premium is None:
                     result["filter_reason"] = "no_premium"
-                elif last > MAX_PREMIUM:
-                    result["filter_reason"] = f"premium_too_high ({last})"
+                elif entry_premium > MAX_PREMIUM:
+                    result["filter_reason"] = f"premium_too_high ({entry_premium})"
                 elif spread > MAX_SPREAD:
                     result["filter_reason"] = f"spread_too_wide ({spread:.2f})"
                 else:
@@ -365,7 +412,6 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
         except Exception as e:
             result["filter_reason"] = f"quote_error: {e}"
 
-        # 5 CALL فوق السعر + 5 PUT تحت السعر
         calls_above = sorted(
             [c for c in chain if _strike_of(c) > price and _call_of(c)],
             key=lambda c: _strike_of(c)
@@ -461,10 +507,10 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
 # analyze_symbol
 # ============================================================
 def analyze_symbol(symbol: str) -> dict:
-    df_weekly = candles_to_df(fetch_candles(symbol, "1w", 150))
-    df_daily  = candles_to_df(fetch_candles(symbol, "1d", 400))
-    df_4h     = candles_to_df(fetch_candles(symbol, "4h", 200))
-    df_1h     = candles_to_df(fetch_candles(symbol, "1h", 200))
+    df_weekly = candles_to_df(fetch_candles(symbol, "1w", 150), "1w")
+    df_daily  = candles_to_df(fetch_candles(symbol, "1d", 400), "1d")
+    df_4h     = candles_to_df(fetch_candles(symbol, "4h", 200), "4h")
+    df_1h     = candles_to_df(fetch_candles(symbol, "1h", 200), "1h")
 
     q = get_ctx().quote([norm(symbol)])[0]
     price = float(q.last_done)
@@ -585,7 +631,6 @@ async def run_scan(scan_id: str):
                 card = data.get("card", {})
                 color = card.get("color", "gray")
 
-                # ✅ الرمادي: لا نضيفه للنتائج نهائياً
                 if color in VALID_COLORS:
                     scan["results_map"][sym] = data
                     scan["results"].append(data)
