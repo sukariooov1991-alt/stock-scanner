@@ -3,7 +3,7 @@ main.py — Longbridge Options Radar Scanner
 النسخة النهائية — 4 فريمات، مساران، حذف الرمادي نهائياً
 + توحيد صريح للأوقات
 + رفض الإشارات الميتة
-+ تحليل ذكي عبر Gemini (نص عربي لكل بطاقة)
++ تحليل ذكي عبر Gemini (منفصل — لا يعطّل عرض البطاقة)
 """
 import os
 import time
@@ -38,10 +38,10 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 # ✅ Gemini
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODELS  = [
-    "gemini-3.8-flash",       # ✅ النموذج الأساسي الموصى به
-    "gemini-3.5-flash-lite",  # ✅ بديل أسرع
-    "gemini-3.1-flash-lite",  # ✅ بديل أخف
-    "gemini-3.6-flash",       # ✅ بديل إضافي
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3.6-flash",
 ]
 GEMINI_TIMEOUT = 12
 
@@ -52,7 +52,7 @@ _analyze_cache: dict[str, tuple[float, dict]] = {}
 _ANALYZE_TTL = 25
 
 _ai_cache: dict[str, tuple[float, str]] = {}
-_AI_CACHE_TTL = 1800  # 30 دقيقة
+_AI_CACHE_TTL = 1800
 
 # ✅ فلاتر العقد
 MAX_PREMIUM = 2.5
@@ -168,7 +168,7 @@ def send_telegram_alert(message: str) -> bool:
 
 
 # ============================================================
-# Gemini — تحليل ذكي
+# Gemini — تحليل ذكي (يُستدعى عبر endpoint منفصل)
 # ============================================================
 def _build_ai_prompt(data: dict) -> str:
     sym = data.get("symbol", "")
@@ -633,7 +633,7 @@ def _is_dead_signal(scan: dict, price: float) -> bool:
 
 
 # ============================================================
-# analyze_symbol
+# analyze_symbol — بدون Gemini (سريع، يعيد البطاقة كاملة فوراً)
 # ============================================================
 def analyze_symbol(symbol: str) -> dict:
     df_weekly = candles_to_df(fetch_candles(symbol, "1w", 150), "1w")
@@ -678,7 +678,7 @@ def analyze_symbol(symbol: str) -> dict:
         if sr["daily"].get("support"): supports.append(sr["daily"]["support"])
         if sr["daily"].get("resistance"): resistances.append(sr["daily"]["resistance"])
 
-    result = {
+    return {
         "symbol": symbol.upper(),
         "price": round(price, 2),
         "prevClose": round(prev_close, 2),
@@ -702,15 +702,6 @@ def analyze_symbol(symbol: str) -> dict:
         "filter_reason": opt.get("filter_reason", ""),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-
-    try:
-        ai_text = get_ai_analysis(result)
-        if ai_text:
-            result["ai_analysis"] = ai_text
-    except Exception as e:
-        print(f"[AI] {symbol}: {e}", flush=True)
-
-    return result
 
 
 def analyze_cached(symbol):
@@ -965,6 +956,39 @@ def test_gemini():
     }
     text = get_ai_analysis(sample)
     return {"ok": bool(text), "text": text, "models_tried": GEMINI_MODELS}
+
+
+# ✅ نقطة API جديدة — تحليل Gemini لسهم واحد (منفصل عن المسح)
+@app.get("/api/ai/{symbol}")
+async def ai_analysis(symbol: str):
+    """
+    يُستدعى من الواجهة بعد عرض البطاقة.
+    يعتمد على الكاش (analyze_cached) — لا يعيد جلب الشموع إن كانت حديثة.
+    """
+    if not GEMINI_API_KEY:
+        return {"ok": False, "reason": "no_key"}
+    sym = symbol.upper().strip()
+    if not sym:
+        return {"ok": False, "reason": "no_symbol"}
+
+    cached = _ai_cache.get(sym)
+    if cached and time.time() - cached[0] < _AI_CACHE_TTL:
+        return {"ok": True, "text": cached[1], "cached": True}
+
+    try:
+        data = await asyncio.to_thread(analyze_cached, sym)
+    except Exception as e:
+        return {"ok": False, "reason": f"analyze_error: {e}"}
+
+    if data.get("card", {}).get("color") not in VALID_COLORS:
+        return {"ok": False, "reason": "no_signal"}
+
+    try:
+        text = await asyncio.to_thread(get_ai_analysis, data)
+    except Exception as e:
+        return {"ok": False, "reason": f"ai_error: {e}"}
+
+    return {"ok": bool(text), "text": text}
 
 
 @app.get("/api/symbols")
